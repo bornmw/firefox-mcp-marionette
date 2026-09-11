@@ -1,12 +1,22 @@
 #!/usr/bin/env node
-// server.mjs — Model Context Protocol server (stdio) that drives a user-launched
-// Firefox (firefox --marionette, default port 2828) via its native wire protocol.
+// server.mjs — Model Context Protocol server (stdio) that drives a Firefox with
+// Marionette (firefox --marionette, default port 2828) via its native wire
+// protocol.
+//
+// ATTACH-FIRST: it connects to an instance that exists. When the first browser
+// call of a session finds no reachable Firefox, the tool does not fail with a
+// raw ECONNREFUSED — it returns a bootstrap decision (fx_launch a new dedicated
+// instance / fx_connect to an existing one / the user's own direction) that the
+// agent relays to the user.
 //
 // MCP transport: newline-delimited JSON-RPC 2.0 on stdin/stdout; stderr = logs.
 // Zero runtime dependencies (Node >= 20).
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import net from 'node:net';
+import { spawn, spawnSync } from 'node:child_process';
 import { Marionette } from './marionette.mjs';
 import { unwrapElementRef } from './protocol.mjs';
 import { EVAL_WRAP, EVAL_POLL } from './evalwrap.mjs';
@@ -14,6 +24,12 @@ import { EVAL_WRAP, EVAL_POLL } from './evalwrap.mjs';
 const HOST = process.env.FX_MARIONETTE_HOST || '127.0.0.1';
 const PORT = Number(process.env.FX_MARIONETTE_PORT || 2828);
 const FILE_ROOTS = (process.env.FX_MCP_FILE_ROOTS || '/tmp').split(',').map((s) => s.trim()).filter(Boolean);
+// Bootstrap (first-trigger) launch settings. fx_launch/autolaunch create a DEDICATED
+// profile and set the port via user.js PREFS — there is no --marionette-port CLI flag.
+function defaultProfileRoot() { try { return path.join(os.homedir(), '.mozilla', 'firefox'); } catch { return '/tmp/marionette-mcp-profiles'; } }
+const PROFILE_ROOT = process.env.FX_MCP_PROFILE_DIR || defaultProfileRoot();
+const AUTO_LAUNCH = /^(1|true|yes)$/i.test(process.env.FX_MCP_AUTO_LAUNCH || '');
+const FIREFOX_BIN = process.env.FX_MCP_FIREFOX_BIN || ''; // "cmd [args]" — e.g. a test stand-in
 
 const log = (...a) => process.stderr.write(new Date().toISOString() + ' ' + a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ') + '\n');
 
@@ -630,7 +646,21 @@ function fmtField(f) {
 const T = (name, desc, schema, fn) => ({ name, description: desc, inputSchema: { type: 'object', properties: schema, additionalProperties: false }, fn });
 
 const TOOLS = [
-  T('fx_status', 'Health: connection, session, active + configured endpoint, current page, navigator.webdriver flag', {}, async () => {
+  T('fx_status', 'Health: connection, session, active + configured endpoint, current page, navigator.webdriver flag. When no Marionette Firefox is reachable it does NOT error — it reports connected:false with the probe result and the bootstrap options (start a new instance / connect an existing one).', {}, async () => {
+    const launched = launchedInfo();
+    try {
+      await ensureConn();
+    } catch (e) {
+      const probe = classifyConnError(e);
+      return {
+        connected: false,
+        endpoint: { host: M.host, port: M.port },
+        configured: { host: HOST, port: PORT },
+        probe,
+        bootstrap: bootstrapOptions(probe),
+        ...launched,
+      };
+    }
     const pi = await pageInfo();
     return {
       connected: true,
@@ -639,7 +669,46 @@ const TOOLS = [
       protocol: M.hello && M.hello.marionetteProtocol,
       session: M.sessionId,
       ...pi,
+      ...launched,
     };
+  }),
+  T('fx_launch', 'Bootstrap option 1 — start a NEW dedicated Firefox with Marionette: a fresh profile on a NEW port, with the port set through the profile user.js PREFERENCES (user_pref marionette.port / marionette.enabled — Firefox has no --marionette-port CLI flag, so this is the only way to move it off the default 2828), then `firefox --marionette --no-remote -profile <dir>`, and attach to it. The instance starts empty (no cookies/logins from your daily profile). Port defaults to the first free port above the configured one. Binary: FX_MCP_FIREFOX_BIN env (e.g. "node /path/standin.mjs") or firefox on PATH / common system paths. Returns the started pid, port, and profile, and leaves the MCP attached to the new instance.', { port: { type: 'number', description: 'marionette port; default = first free port above the configured one' }, profile: { type: 'string', description: 'profile directory; default <profile root>/marionette-mcp-<port>' } }, async (a) => {
+    const l = await doLaunch(a || {});
+    return {
+      ok: true,
+      ...l,
+      endpoint: { host: '127.0.0.1', port: l.port },
+      configured: { host: HOST, port: PORT },
+      note: l.started === 'new-instance'
+        ? 'fresh dedicated profile — starts with no cookies/logins; stop it later with fx_shutdown {port: ' + l.port + '}'
+        : 're-attached to the instance this MCP started on this port',
+    };
+  }),
+  T('fx_shutdown', 'Stop a Firefox that THIS server started via fx_launch (killed by the recorded pid — a user-launched browser is never touched). Omit {port} to stop the endpoint this MCP is attached to.', { port: { type: 'number', description: 'port of the fx_launch-managed instance to stop' } }, async (a) => {
+    const ports = [];
+    if (a && a.port != null) ports.push(Number(a.port));
+    else if (M.host === '127.0.0.1') ports.push(M.port);
+    if (!ports.length) ports.push(PORT);
+    for (const p of ports) {
+      let rec = LAUNCHED.get(p);
+      if (!rec) {
+        const f = path.join(PROFILE_ROOT, 'marionette-mcp-' + p, '.marionette-mcp-launched.json');
+        if (fs.existsSync(f)) { try { rec = JSON.parse(fs.readFileSync(f, 'utf8')); } catch { rec = null; } }
+      }
+      if (!rec) continue;
+      const alive = pidAlive(rec.pid);
+      if (alive) try { process.kill(rec.pid, 'SIGTERM'); } catch { /* ignore */ }
+      if (M.host === '127.0.0.1' && M.port === p) {
+        if (M.sock && !M.sock.destroyed) { try { M.sock.destroy(); } catch { /* ignore */ } }
+        M.sock = null;
+        M.sessionId = null;
+        M.pending.clear();
+        connected = false;
+      }
+      LAUNCHED.delete(p);
+      return { ok: true, stopped: alive, pid: rec.pid, port: p, profile: rec.profile, note: alive ? 'SIGTERM sent' : 'already gone (stale record cleared)' };
+    }
+    throw new Error('no fx_launch-managed instance recorded for port ' + ports.join(',') + ' — only browsers started by this server can be stopped; a Firefox you start yourself stays yours');
   }),
   T('fx_connect', 'Point the MCP at a Firefox endpoint (host/port) and (re)attach. Marionette serves ONE client per browser, so use a dedicated instance per automation — the env-configured default (FX_MARIONETTE_HOST/PORT) is used when both args are omitted. Loopback only (by design). Returns the active endpoint + session after (re)attach.', { host: { type: 'string', description: 'loopback host, default 127.0.0.1' }, port: { type: 'number', description: 'marionette port, default = configured env port' } }, async (a) => {
     if (a.host !== undefined) {
@@ -1159,16 +1228,186 @@ async function ensureConn() {
   connected = true;
 }
 
-function toolResult(payload) {
+function toolResult(payload, opts) {
+  const isError = !!(opts && opts.isError);
   if (payload && typeof payload === 'object' && !Array.isArray(payload) && typeof payload.text !== 'string') {
-    return { content: [{ type: 'text', text: JSON.stringify(payload, null, 1) }], isError: false };
+    return { content: [{ type: 'text', text: JSON.stringify(payload, null, 1) }], isError };
   }
   // A pure {text: <string>} wrapper (e.g. fx_alert_state) carries its content in
   // `text` — String(payload) would render "[object Object]" and lose it.
   if (payload && typeof payload === 'object' && !Array.isArray(payload) && typeof payload.text === 'string' && Object.keys(payload).length === 1) {
-    return { content: [{ type: 'text', text: payload.text }], isError: false };
+    return { content: [{ type: 'text', text: payload.text }], isError };
   }
-  return { content: [{ type: 'text', text: String(payload ?? '') }], isError: false };
+  return { content: [{ type: 'text', text: String(payload ?? '') }], isError };
+}
+
+// ---------------- bootstrap: no reachable Firefox yet ----------------
+// The stdio server process lives with one automation session (e.g. one opencode
+// session). Its first browser call probes the configured endpoint; when no
+// Marionette Firefox is reachable, the tool does not fail with a raw error — it
+// returns a structured DECISION payload (isError) with three options, and the
+// agent asks the user which one: start a NEW dedicated instance (fx_launch,
+// port set via profile user.js PREFERENCES — there is no --marionette-port
+// flag), attach to an ALREADY-RUNNING instance (fx_connect with host/port the
+// user provides), or do something else (user-directed). fx_status is exempt
+// and always reports state; fx_launch/fx_shutdown/fx_connect act on it.
+const BOOTSTRAP_EXEMPT = new Set(['fx_status', 'fx_connect', 'fx_launch', 'fx_shutdown']);
+
+function classifyConnError(e) {
+  const m = String((e && e.message) || e);
+  if (/nothing is listening|econnrefused|refused/i.test(m)) return 'nothing-listening';
+  if (/econnreset|reset/i.test(m)) return 'busy-other-client';
+  if (/timeout|err_socket/i.test(m)) return 'timeout';
+  return 'error';
+}
+
+function bootstrapOptions(probe) {
+  const where = M.host + ':' + M.port;
+  let question;
+  let option2;
+  if (probe === 'busy-other-client') {
+    question = 'Something answers on ' + where + ' but drops the connection — a Marionette browser there likely already holds another active client (Marionette serves ONE client per browser). What should I do?';
+    option2 = { id: 2, tool: 'fx_connect', do: 'Free the other client (or ask the user to close it / point at the right port), then re-attach: fx_connect {host, port}.' };
+  } else {
+    question = probe === 'timeout'
+      ? 'Could not complete a connection to ' + where + ' in time — nothing usable is listening there. What should I do?'
+      : 'No Marionette-enabled Firefox is reachable on ' + where + ' — this session has no browser yet. What should I do?';
+    option2 = { id: 2, tool: 'fx_connect', do: 'Connect to an ALREADY-RUNNING Firefox: ask the user for its loopback {host, port} (port 2828 → plain `firefox --marionette`; custom port → that port must be set in the profile user.js, as user_pref("marionette.port", N)) and call fx_connect {host, port}.' };
+  }
+  return {
+    question,
+    options: [
+      { id: 1, tool: 'fx_launch', do: 'Start a NEW dedicated Firefox: fresh profile on a NEW port, the port written to the profile user.js pref marionette.port (no CLI flag exists for it). fx_launch {} auto-picks a free port; fx_launch {port} picks a specific one. It will start empty — no cookies/logins from your daily profile.' },
+      option2,
+      { id: 3, tool: null, do: 'Something else: follow the user’s direction — e.g. they launch Firefox themselves (their profile, their port) and give us the endpoint, or we reconfigure FX_MARIONETTE_HOST/PORT and retry later.' },
+    ],
+  };
+}
+
+// ---------------- launching a dedicated Firefox (bootstrap option 1) ----------------
+// The port is NEVER a launch flag — Firefox has no --marionette-port. A fresh
+// profile gets the port via user.js PREFERENCES (user_pref marionette.port /
+// marionette.enabled), then we run `firefox --marionette --no-remote -profile
+// <dir>` detached, wait for its listener, and re-point this server at it.
+const LAUNCHED = new Map(); // port -> { pid, profile, ts }
+
+function launchedInfo() {
+  const recs = [];
+  for (const [p, r] of LAUNCHED) recs.push({ port: p, pid: r.pid, profile: r.profile });
+  return { launched: recs, launchedCurrent: LAUNCHED.has(M.port) && M.host === '127.0.0.1' };
+}
+
+function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+
+function portOpen(host, port) {
+  return new Promise((res) => {
+    const s = net.connect(port, host);
+    s.setTimeout(800, () => { s.destroy(); res(false); });
+    s.once('connect', () => { s.destroy(); res(true); });
+    s.once('error', () => res(false));
+  });
+}
+
+function portFree(host, port) {
+  return new Promise((res) => {
+    const srv = net.createServer();
+    srv.once('error', () => res(false));
+    srv.listen(port, host, () => srv.close(() => res(true)));
+  });
+}
+
+async function pickFreePort(span = 50) {
+  for (let p = PORT + 1; p < PORT + 1 + span && p < 65535; p++) {
+    if (await portFree('127.0.0.1', p)) return p;
+  }
+  const srv = net.createServer();
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const p = srv.address().port;
+  srv.close();
+  return p;
+}
+
+function resolveLaunchCommand() {
+  if (FIREFOX_BIN) {
+    const parts = FIREFOX_BIN.trim().split(/\s+/);
+    return { bin: parts[0], preArgs: parts.slice(1) };
+  }
+  const cands = [];
+  try {
+    const w = spawnSync('which', ['firefox', 'firefox-esr'], { encoding: 'utf8' });
+    for (const line of String(w.stdout || '').split('\n')) { const b = line.trim(); if (b) cands.push(b); }
+  } catch { /* no which */ }
+  cands.push('/usr/bin/firefox', '/usr/local/bin/firefox', '/snap/bin/firefox', '/usr/lib/firefox/firefox', '/opt/homebrew/bin/firefox', '/usr/bin/firefox-esr');
+  for (const b of cands) if (fs.existsSync(b)) return { bin: b, preArgs: [] };
+  return { bin: 'firefox', preArgs: [] }; // let spawn fail with a named-binary error
+}
+
+// Idempotent: writes the two Marionette prefs into the profile user.js only if
+// they are not already present (a later user_pref line overrides an earlier one).
+function ensureUserJs(profile, port) {
+  fs.mkdirSync(profile, { recursive: true });
+  const f = path.join(profile, 'user.js');
+  let cur = fs.existsSync(f) ? fs.readFileSync(f, 'utf8').replace(/\s+$/, '') : '';
+  const add = [];
+  for (const pref of ['user_pref("marionette.enabled", true);', 'user_pref("marionette.port", ' + port + ');']) {
+    if (!cur.includes(pref)) add.push(pref);
+  }
+  if (add.length) cur = (cur ? cur + '\n' : '') + add.join('\n') + '\n';
+  fs.writeFileSync(f, cur);
+}
+
+async function launchInstance({ port, profile }) {
+  const { bin, preArgs } = resolveLaunchCommand();
+  ensureUserJs(profile, port);
+  const child = spawn(bin, [...preArgs, '--marionette', '--no-remote', '-profile', profile], { detached: true, stdio: 'ignore' });
+  child.unref();
+  const rec = { pid: child.pid, profile, ts: new Date().toISOString() };
+  LAUNCHED.set(port, rec);
+  try { fs.writeFileSync(path.join(profile, '.marionette-mcp-launched.json'), JSON.stringify(rec, null, 1) + '\n'); } catch { /* best effort */ }
+  const t0 = Date.now();
+  let up = false;
+  while (Date.now() - t0 < 30000 && !up) {
+    up = await portOpen('127.0.0.1', port);
+    if (!up) await new Promise((r) => setTimeout(r, 400));
+  }
+  if (!up) {
+    try { process.kill(rec.pid, 'SIGKILL'); } catch { /* already gone */ }
+    LAUNCHED.delete(port);
+    throw new Error('Firefox (binary: ' + bin + ') did not open a Marionette listener on 127.0.0.1:' + port + ' within 30 s — launch aborted, process killed');
+  }
+  M.host = '127.0.0.1';
+  M.port = port;
+  if (M.sock && !M.sock.destroyed) { try { M.sock.destroy(); } catch { /* ignore */ } }
+  M.sock = null;
+  M.sessionId = null;
+  M.pending.clear();
+  connected = false;
+  await ensureConn();
+  return rec;
+}
+
+async function doLaunch(args) {
+  let port = args.port != null ? Number(args.port) : undefined;
+  if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new Error('port must be an integer 1..65535');
+  if (port === undefined) port = await pickFreePort();
+  const profile = args.profile != null ? path.resolve(String(args.profile)) : path.join(PROFILE_ROOT, 'marionette-mcp-' + port);
+  const ours = LAUNCHED.get(port);
+  if (ours && pidAlive(ours.pid) && await portOpen('127.0.0.1', port)) {
+    M.host = '127.0.0.1';
+    M.port = port;
+    if (M.sock && !M.sock.destroyed) { try { M.sock.destroy(); } catch { /* ignore */ } }
+    M.sock = null;
+    M.sessionId = null;
+    M.pending.clear();
+    connected = false;
+    await ensureConn();
+    return { started: 'reused-launched', pid: ours.pid, port, profile: ours.profile };
+  }
+  if (await portOpen('127.0.0.1', port)) {
+    throw new Error('port ' + port + ' is already in use by something else — pick another port, or use fx_connect {host: "127.0.0.1", port: ' + port + '} to attach to it');
+  }
+  const rec = await launchInstance({ port, profile });
+  return { started: 'new-instance', pid: rec.pid, port, profile };
 }
 
 async function handle(obj) {
@@ -1190,9 +1429,30 @@ async function handle(obj) {
     } else if (method === 'tools/call') {
       const tool = TOOLS.find((t) => t.name === params.name);
       if (!tool) throw new Error('unknown tool: ' + params.name);
-      if (tool.name !== 'fx_connect') await ensureConn(); // fx_connect manages its own (re)connect
-      const payload = await tool.fn(params.arguments || {});
-      result = toolResult(payload);
+      let payload;
+      let autoStarted = null;
+      if (!BOOTSTRAP_EXEMPT.has(tool.name)) {
+        try {
+          await ensureConn();
+        } catch (e) {
+          const probe = classifyConnError(e);
+          if (probe === 'error') throw e;
+          if (AUTO_LAUNCH && probe === 'nothing-listening') {
+            const l = await doLaunch({});
+            autoStarted = { started: l.started, pid: l.pid, port: l.port, profile: l.profile };
+            // fall through: the tool now runs against the freshly started instance
+          } else {
+            payload = { ok: false, need_bootstrap: true, probe, endpoint: { host: M.host, port: M.port }, ...bootstrapOptions(probe) };
+          }
+        }
+      }
+      if (payload === undefined) payload = await tool.fn(params.arguments || {});
+      if (autoStarted && payload !== undefined) {
+        if (payload && typeof payload === 'object' && !Array.isArray(payload)) payload = Object.assign({}, payload, { auto_started: autoStarted });
+        else payload = JSON.stringify({ auto_started: autoStarted, result: payload });
+      }
+      result = toolResult(payload, { isError: payload !== undefined && payload.ok === false && payload.need_bootstrap === true });
+      isError = result.isError;
     } else if (typeof method === 'string' && method.startsWith('notifications/')) {
       result = null; // client notification (e.g. notifications/initialized) — acknowledge, no response
     } else {
@@ -1248,4 +1508,4 @@ function enqueue(chunk) {
 
 process.stdin.on('data', enqueue);
 process.stdin.on('end', () => { stdinEof = true; drain(); });
-log('marionette-mcp ready on', HOST + ':' + PORT, 'file roots:', FILE_ROOTS.join(' '));
+log('marionette-mcp ready on', HOST + ':' + PORT, 'file roots:', FILE_ROOTS.join(' '), 'autoLaunch:', AUTO_LAUNCH, 'profileRoot:', PROFILE_ROOT);

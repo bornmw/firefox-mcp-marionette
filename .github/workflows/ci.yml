@@ -23,4 +23,4 @@ jobs:
           node --check src/server.mjs
 
       - name: Run tests
-        run: node --test test/protocol.test.mjs test/marionette.test.mjs test/server.test.mjs
+        run: node --test test/*.test.mjs

@@ -81,8 +81,8 @@ test('initialize returns server identity and echoes protocol version', async () 
 test('tools/list exposes the full tool table', async () => {
   const r = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
   const names = r.result.tools.map((t) => t.name);
-  assert.equal(names.length, 27, names.join(','));
-  for (const n of ['fx_status', 'fx_connect', 'fx_navigate', 'fx_snapshot', 'fx_click', 'fx_type', 'fx_select', 'fx_toggle', 'fx_upload', 'fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_links', 'fx_extract', 'fx_search', 'fx_eval', 'fx_wait', 'fx_screenshot', 'fx_cookies']) {
+  assert.equal(names.length, 29, names.join(','));
+  for (const n of ['fx_status', 'fx_launch', 'fx_shutdown', 'fx_connect', 'fx_navigate', 'fx_snapshot', 'fx_click', 'fx_type', 'fx_select', 'fx_toggle', 'fx_upload', 'fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_links', 'fx_extract', 'fx_search', 'fx_eval', 'fx_wait', 'fx_screenshot', 'fx_cookies']) {
     assert.ok(names.includes(n), 'missing tool ' + n);
   }
   for (const t of r.result.tools) {

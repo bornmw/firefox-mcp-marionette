@@ -13,7 +13,9 @@ const SNAPSHOT_ROWS = [
   { k: 'button:submit', x: '/html/body/button[1]', t: 'Go', css: '#go', id: 'go', ph: '', al: '', val: '', sel: '', dis: '' },
 ];
 
-export function startFakeMarionette() {
+// port = 0 (default) → ephemeral; a fixed port is used by fake_firefox.mjs,
+// which must honor the marionette.port preference written into its profile.
+export function startFakeMarionette(port = 0) {
   const state = {
     frames: [],
     violations: [],
@@ -55,11 +57,12 @@ export function startFakeMarionette() {
       }
     });
   });
-  return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
-      const port = server.address().port;
+  return new Promise((resolve, reject) => {
+    server.once('error', (e) => reject(e));
+    server.listen(port, '127.0.0.1', () => {
+      const p = server.address().port;
       resolve({
-        port,
+        port: p,
         state,
         closeAll: () => {
           for (const s of [...state.sockets]) s.destroy();

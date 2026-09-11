@@ -1,6 +1,6 @@
 # marionette-mcp
 
-Zero-dependency [Model Context Protocol](https://modelcontextprotocol.io) server that drives **your own Firefox** — the instance *you* launched with `--marionette` — via its native wire protocol.
+Zero-dependency [Model Context Protocol](https://modelcontextprotocol.io) server that drives a Firefox with Marionette enabled — the instance *you* launched with `--marionette` (attach-first), or a **dedicated instance the MCP starts for you** on request — via its native wire protocol.
 
 AI agents get a precise DOM actuator: snapshot the interactive elements of a page, then click, type, select, toggle checkboxes, upload files, wait for conditions, run JS, and screenshot — all against the browser session you control (your profile, your logins, your kill switch).
 
@@ -8,7 +8,7 @@ AI agents get a precise DOM actuator: snapshot the interactive elements of a pag
 
 Playwright's browser-automation channels (CDP, extension mode) target Chromium, or force *the library* to launch and own a pinned browser build. Marionette is different:
 
-* **You own the browser.** Firefox starts manually, in whatever profile you chose. The MCP server only *attaches* over loopback TCP (default port 2828). Nothing in this repo launches, downloads, or upgrades a browser.
+* **You own the browser.** Attach-first: the server connects over loopback TCP (default port 2828) to the Firefox *you* launched, in whatever profile you chose. When a session has no browser yet, the MCP asks instead of failing — and if you choose it, `fx_launch` starts a fresh, dedicated, loopback-only instance with a clean profile. Nothing in this repo downloads or upgrades a browser.
 * **Zero dependencies.** No `npm install` of runtime deps, no browser downloads, no CDP shim. One Node runtime (>= 20) plus your existing Firefox.
 * **Native protocol.** Frames are length-prefixed JSON over TCP — the same protocol Selenium's Firefox driver speaks. No protocol translation, no version drift.
 
@@ -18,7 +18,7 @@ Playwright's browser-automation channels (CDP, extension mode) target Chromium, 
  AI agent (e.g. opencode)
         │  stdio · newline-delimited JSON-RPC 2.0
         ▼
-  marionette-mcp (src/server.mjs)          ── tools: fx_* (27)
+  marionette-mcp (src/server.mjs)          ── tools: fx_* (29)
         │  loopback TCP · <byteLen>:<json> frames
         ▼
  your Firefox (firefox --marionette)      ── your profile, your cookies
@@ -39,7 +39,9 @@ Playwright's browser-automation channels (CDP, extension mode) target Chromium, 
 * **DOM `checked` ≠ framework form state.** Frameworks (notably Ashby) register a choice only on a real *change*. `fx_answer` therefore detects a stale pre-selected option (or an ineffective click) and runs a toggle cycle — click another option, then the target — on exclusive (radio/button) groups, re-verifying afterwards; `fx_form` aggregates radio/checkbox inputs into choice groups (question context + per-option state) so required groups can be audited in one call.
  * Marionette keeps a **persistent session across reconnects**; a crashed automation client can leave stale session state — relaunch the browser if commands queue forever.
  * **A single command must always settle.** Commands are serialized and the browser's main thread can stall (modal dialog, hung navigation), so `send()` bounds every command via `FX_MCP_CMD_TIMEOUT_MS` (default 120 s). On expiry the connection is poisoned (socket destroyed, session cleared) and the next command reconnects fresh — without that, one unanswered command wedges the entire server forever.
- * **Socket events are per-socket.** The `error`/`close` handlers only act when `this.sock === s`. A superseded socket (dropped during a command-timeout poison) can emit *late* events after we've reconnected; reacting to them would destroy the fresh, healthy socket.
+  * **Socket events are per-socket.** The `error`/`close` handlers only act when `this.sock === s`. A superseded socket (dropped during a command-timeout poison) can emit *late* events after we've reconnected; reacting to them would destroy the fresh, healthy socket.
+  * **Bootstrap is a decision, not an error.** The server process == one automation session. Its first browser call probes the configured endpoint; when nothing is listening, tools return a structured `need_bootstrap` payload (isError) with the three options (launch new / connect existing / user-directed) instead of a bare `ECONNREFUSED` — the agent asks the user and acts on the choice (`FX_MCP_AUTO_LAUNCH=1` collapses it to auto-launch). `fx_status` stays a pure status report either way.
+  * **The launch port lives in prefs, never on the command line.** Firefox has no `--marionette-port` flag, so `fx_launch` creates a fresh profile and writes `user_pref("marionette.port", N)` + `user_pref("marionette.enabled", true)` to its `user.js` before `firefox --marionette --no-remote -profile <dir>`. The started pid is recorded (memory + `<profile>/.marionette-mcp-launched.json`) so `fx_shutdown` kills exactly that instance — a user-launched browser is never touched.
 
 ## Quick start
 
@@ -51,12 +53,24 @@ firefox --marionette
 node scripts/e2e-live.mjs        # optional: live smoke test
 ```
 
-### Matching the port (the MCP only ATTACHES — it never launches Firefox)
+### First trigger in a session: the MCP probes, then asks
 
-By design nothing in this repo starts a browser: the server only *attaches* over loopback TCP to the `firefox --marionette` instance **you** launched (your profile, your cookies, your kill switch). So the browser's Marionette port must equal the MCP's port:
+The stdio server lives with one automation session (one opencode session). On the **first browser call** it probes the configured endpoint (`FX_MARIONETTE_HOST:PORT`):
+
+* **Something reachable** → it simply attaches. Nothing else happens.
+* **Nothing reachable** → instead of a raw `ECONNREFUSED`, every browser tool returns a structured `need_bootstrap` decision with three options, and the agent asks **you**:
+  1. **Start a new dedicated instance** — `fx_launch`: the server picks a free port, writes that port into a fresh profile's `user.js` **prefs** (`user_pref("marionette.port", N)` + `marionette.enabled` — there is no `--marionette-port` CLI flag), runs `firefox --marionette --no-remote -profile <dir>`, and attaches to it. The instance starts empty (no cookies/logins). Stop it later with `fx_shutdown`.
+  2. **Connect to an already-running instance** — `fx_connect {host, port}` with details you provide.
+  3. **Something else** — your direction (launch it yourself, reconfigure the endpoint, …).
+
+`fx_status` always reports state (never errors on "no browser"): `connected`, `endpoint` vs `configured`, the probe result, and the options while unbootstrapped; plus `launched`/`launchedCurrent` when this server started the browser. `FX_MCP_AUTO_LAUNCH=1` skips the question and boots option 1 transparently (the tool runs in the same call, result tagged `auto_started`).
+
+### Matching the port (attach-first; launch only when you decide it)
+
+The server attaches over loopback TCP to a `firefox --marionette` instance on `FX_MARIONETTE_HOST:PORT` (you launched it, or `fx_launch` started it for this session). So the browser's Marionette port must equal the endpoint of the MCP:
 
 * **Default port 2828** (both sides) → just `firefox --marionette`. No extra config needed.
-* **Custom port** → there is **no `--marionette-port` CLI flag**. Use a dedicated profile and set the port in its `user.js`:
+* **Custom port** → there is **no `--marionette-port` CLI flag**. The port is always set through the profile's `user.js` prefs. Let `fx_launch {port: 2829}` do the whole procedure (fresh profile dir + prefs + launch + attach), or do it by hand:
 
   ```bash
   PROFILE=~/.mozilla/firefox/mcp-2829   # any dir
@@ -101,8 +115,10 @@ Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop che
 
 | Tool | Purpose |
 |---|---|
-| `fx_status` | Connection, active **`endpoint`** vs `configured`, session, current page, `navigator.webdriver` |
-| `fx_connect` | (Re-)point the MCP at a loopback endpoint `{host, port}` and re-attach (env-configured default when omitted). Returns the active endpoint, the configured one, and the session. Use it to target a dedicated instance without restarting the client. |
+| `fx_status` | Connection, active **`endpoint`** vs `configured`, session, current page, `navigator.webdriver`. With no reachable browser it does NOT error — returns `connected:false`, the probe result, and the bootstrap options; reports `launched`/`launchedCurrent` when this server started the instance |
+| `fx_launch` | Bootstrap option 1: start a NEW dedicated Firefox — fresh profile (`<root>/marionette-mcp-<port>`), port written into `user.js` **prefs** (`marionette.port`; no CLI flag exists), `firefox --marionette --no-remote -profile <dir>`, wait for the listener, attach. Optional `{port}` (default: first free above the configured one) and `{profile}` dir. Reuse: re-calling with the same live port re-attaches, no second process |
+| `fx_shutdown` | Stop an instance this server started via `fx_launch` (killed by the recorded pid; a user-launched browser is never touched). Defaults to the current endpoint |
+| `fx_connect` | Bootstrap option 2: (re-)point the MCP at an already-running loopback endpoint `{host, port}` and re-attach (env-configured default when omitted). Returns the active endpoint, the configured one, and the session |
 | `fx_navigate` | Go to a URL |
 | `fx_page` | Current URL + title |
 | `fx_snapshot` | Interactive-element map with refs (incl. visible `label` text when present) |
@@ -134,24 +150,29 @@ Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop che
 | `FX_MARIONETTE_PORT` | `2828` | Firefox's `--marionette` port (must match the browser you launch; `fx_status` shows the active endpoint). Override at runtime with `fx_connect {port}` |
 | `FX_MCP_FILE_ROOTS` | `/tmp` | Comma-separated roots that `fx_upload`/`fx_screenshot` may touch |
 | `FX_MCP_CMD_TIMEOUT_MS` | `120000` | Per-command bound. A command that never settles (modal dialog, hung page) poisons the connection and auto-reconnects on the next command, so one stuck page can't wedge the whole server |
+| `FX_MCP_AUTO_LAUNCH` | off | When the first-call probe finds no reachable Firefox, `fx_launch` runs automatically instead of returning the bootstrap question |
+| `FX_MCP_FIREFOX_BIN` | auto-detect | Firefox binary for `fx_launch` / auto-launch: a path or `"cmd args"` string (e.g. `node /path/standin.mjs`); default looks up `firefox`/`firefox-esr` on PATH + common system paths |
+| `FX_MCP_PROFILE_DIR` | `~/.mozilla/firefox` | Base directory for the per-port profiles `fx_launch` creates (`marionette-mcp-<port>/`) |
 
 ## Security
 
 * **Loopback only.** The client connects to `127.0.0.1` — there is deliberately no network path.
 * **File access is rooted.** Uploads and screenshots reject paths outside `FX_MCP_FILE_ROOTS`.
 * **Use a dedicated profile** for automation, and keep the browser visible: a human-in-the-loop is the expected model, not headless stealth. Native OS dialogs (e.g. the file picker) and CAPTCHAs are *not* automatable by design — stop and let the human handle them.
+* **Launch is opt-in and self-contained.** `fx_launch`/auto-launch only create a NEW profile under `FX_MCP_PROFILE_DIR` (never touching your daily profile), bind to `127.0.0.1` only, and record the started pid so `fx_shutdown` can stop exactly that instance — it never kills a browser the user launched.
 
 ## Testing
 
 Zero-dependency test suite (built-in `node:test`):
 
 ```bash
-npm test            # or: node --test test/
+npm test            # or: node --test test/*.test.mjs
 ```
 
 * `test/protocol.test.mjs` — frame codec, parser resilience, element-ref unwrapping (pure unit tests).
 * `test/marionette.test.mjs` — the real client against an in-process fake Marionette server that verifies every frame's byte integrity (non-ASCII payloads included).
 * `test/server.test.mjs` — spawns the real MCP server and drives it end-to-end (JSON-RPC plumbing, all tool paths, framing-safety under Unicode input, stdin-EOF shutdown).
+* `test/bootstrap.test.mjs` — first-trigger behavior against a stand-in "firefox" binary (`test/helpers/fake_firefox.mjs`): the no-browser decision payload, the prefs-based launch (port flows only through `user.js`), attach/reuse, `fx_shutdown` pid lifecycle, and `FX_MCP_AUTO_LAUNCH` inline bootstrap.
 
 Live-browser tests (start your own `firefox --marionette` first; note Marionette serves one active client at a time — no other marionette-mcp client may be attached):
 
