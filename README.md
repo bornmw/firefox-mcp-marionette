@@ -43,15 +43,57 @@ Playwright's browser-automation channels (CDP, extension mode) target Chromium, 
   * **Bootstrap is a decision, not an error.** The server process == one automation session. Its first browser call probes the configured endpoint; when nothing is listening, tools return a structured `need_bootstrap` payload (isError) with the three options (launch new / connect existing / user-directed) instead of a bare `ECONNREFUSED` — the agent asks the user and acts on the choice (`FX_MCP_AUTO_LAUNCH=1` collapses it to auto-launch). `fx_status` stays a pure status report either way.
   * **The launch port lives in prefs, never on the command line.** Firefox has no `--marionette-port` flag, so `fx_launch` creates a fresh profile and writes `user_pref("marionette.port", N)` + `user_pref("marionette.enabled", true)` to its `user.js` before `firefox --marionette --no-remote -profile <dir>`. The started pid is recorded (memory + `<profile>/.firefox-mcp-marionette-launched.json`) so `fx_shutdown` kills exactly that instance — a user-launched browser is never touched.
 
+## Install
+
+Prerequisites: **Node.js >= 20** and **Firefox** — that's all; there are no runtime dependencies and nothing ever downloads or upgrades a browser. And the mental model: the server runs *as the child process of your MCP client* over stdio — the client spawns it per session, so there is **no daemon to install, start, or stop yourself**.
+
+Node MCPs are usually distributed through the npm registry, run via `npx` from the client config (the same pattern as `@playwright/mcp` and the official `@modelcontextprotocol/server-*` packages). This server is published that way: **`firefox-mcp-marionette`** — the whole install is one command, no git needed (`npx` ships with Node). Three ways to get the code on your machine:
+
+* **npm (recommended).** `npx -y firefox-mcp-marionette` — one-shot run straight from the registry (that is all step 1 of the Quick start is); or `npm i -g firefox-mcp-marionette` to keep it installed.
+* **Source zip — no git, no npm.** Download the archive in a browser: [main.zip](https://github.com/bornmw/firefox-mcp-marionette/archive/refs/heads/main.zip), unzip it, and point your client config at the extracted `src/server.mjs` instead.
+* **git clone (development/contributing).** `git clone https://github.com/bornmw/firefox-mcp-marionette`; `npm link` optionally puts the bin on PATH.
+
+Copying the repo around? The minimal footprint is the whole `src/` directory (4 files: `server.mjs`, `marionette.mjs`, `protocol.mjs`, `evalwrap.mjs`) — they import each other by relative path, so a single `server.mjs` alone will not work. `scripts/` (smoke tests) and `test/` are optional; nothing in `src/` imports them.
+
 ## Quick start
 
-```bash
-# 1. Launch Firefox with Marionette enabled (dedicated profile recommended)
-firefox --marionette
+The whole setup is: register the server in your MCP client → have a Firefox to attach to (or let the MCP start one) → use the `fx_*` tools.
 
-# 2. Point the MCP client (opencode) at the server
-node scripts/e2e-live.mjs        # optional: live smoke test
+**1. Register the server with your MCP client** (it spawns the server process for you, per session):
+
+opencode (`opencode.json`):
+
+```jsonc
+{
+  "mcp": {
+    "marionette": {
+      "type": "local",
+      "command": ["node", "/absolute/path/to/firefox-mcp-marionette/src/server.mjs"],
+      "environment": {
+        "FX_MARIONETTE_PORT": "2828",
+        "FX_MCP_FILE_ROOTS": "/tmp,/your/projects"
+      },
+      "enabled": true
+    }
+  }
+}
 ```
+
+**2. Have a Firefox listening on port 2828 — or don't.** Either launch one yourself:
+
+```bash
+firefox --marionette        # dedicated profile recommended; default port 2828 matches
+```
+
+or start your agent session and, on the first browser call, the MCP finds nothing reachable and asks you — picking "start a new dedicated instance" runs `fx_launch` for you (fresh profile, port written into `user.js` prefs, attach). `FX_MCP_AUTO_LAUNCH=1` skips the question.
+
+**3. Smoke test (optional):**
+
+```bash
+npm run e2e:live
+```
+
+The `fx_*` tools are now available in-session.
 
 ### First trigger in a session: the MCP probes, then asks
 
@@ -83,25 +125,7 @@ The server attaches over loopback TCP to a `firefox --marionette` instance on `F
 
 * **Verify / diagnose:** `fx_status` reports both the **active `endpoint`** and the **`configured`** endpoint. If it can't connect, the error names the port it tried and how to launch Firefox there (e.g. `ECONNREFUSED 127.0.0.1:2829` → nothing listening; launch as above). Remember Marionette serves **one active client per browser** — don't leave another firefox-mcp-marionette (or another automation) attached to the same instance.
 
-opencode config (opencode.json):
-
-```jsonc
-{
-  "mcp": {
-    "marionette": {
-      "type": "local",
-      "command": ["node", "/absolute/path/to/firefox-mcp-marionette/src/server.mjs"],
-      "environment": {
-        "FX_MARIONETTE_PORT": "2828",
-        "FX_MCP_FILE_ROOTS": "/tmp,/your/projects"
-      },
-      "enabled": true
-    }
-  }
-}
-```
-
-Then the `fx_*` tools are available in-session. Typical flow:
+Typical flow:
 
 1. `fx_navigate` to the page
 2. `fx_snapshot` → numbered map of interactive elements (refs)

@@ -4,8 +4,15 @@
   "description": "Zero-dependency Model Context Protocol server that drives your own Firefox (user-launched, --marionette) — or boots a dedicated loopback-only instance for the session on request — via its native wire protocol: snapshot, click, type, upload, screenshot, JS eval.",
   "type": "module",
   "main": "src/server.mjs",
+  "files": [
+    "src"
+  ],
   "bin": {
     "firefox-mcp-marionette": "src/server.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bornmw/firefox-mcp-marionette.git"
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
