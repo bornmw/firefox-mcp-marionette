@@ -68,7 +68,7 @@ opencode (`opencode.json`):
   "mcp": {
     "marionette": {
       "type": "local",
-      "command": ["node", "/absolute/path/to/firefox-mcp-marionette/src/server.mjs"],
+      "command": ["npx", "-y", "firefox-mcp-marionette"],
       "environment": {
         "FX_MARIONETTE_PORT": "2828",
         "FX_MCP_FILE_ROOTS": "/tmp,/your/projects"
@@ -78,6 +78,8 @@ opencode (`opencode.json`):
   }
 }
 ```
+
+Pin a version with `"command": ["npx", "-y", "firefox-mcp-marionette@0.8.0"]`; developing from a local checkout instead? Use `"command": ["node", "/absolute/path/to/firefox-mcp-marionette/src/server.mjs"]` — the same `environment` block works for both.
 
 **2. Have a Firefox listening on port 2828 — or don't.** Either launch one yourself:
 
