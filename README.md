@@ -12,37 +12,6 @@ Playwright's browser-automation channels (CDP, extension mode) target Chromium, 
 * **Zero dependencies.** No `npm install` of runtime deps, no browser downloads, no CDP shim. One Node runtime (>= 20) plus your existing Firefox.
 * **Native protocol.** Frames are length-prefixed JSON over TCP — the same protocol Selenium's Firefox driver speaks. No protocol translation, no version drift.
 
-## Architecture
-
-```
- AI agent (e.g. opencode)
-        │  stdio · newline-delimited JSON-RPC 2.0
-        ▼
-  firefox-mcp-marionette (src/server.mjs)          ── tools: fx_* (29)
-        │  loopback TCP · <byteLen>:<json> frames
-        ▼
- your Firefox (firefox --marionette)      ── your profile, your cookies
-```
-
-* `src/protocol.mjs` — pure wire codec (frame encode/parse, element-ref unwrap). No I/O, fully unit-tested.
-* `src/marionette.mjs` — async Marionette client (one socket, one session, pending-command map).
-* `src/server.mjs` — MCP stdio server + tool implementations.
-
-### Design notes (bugs that cost real debugging time)
-
-* **Frames are pure ASCII.** `JSON.stringify` does not escape `U+E000`/`U+E001` (W3C file markers) or any char ≥ `0x7F`; in UTF-8 those are multi-byte, while the length prefix is computed from string length. That desynchronizes the stream for the rest of the connection. Every frame is `\uXXXX`-escaped so declared length always equals actual bytes (regression-tested).
-* **Element refs are unwrapped.** `FindElement` replies wrap the uuid (`{ "element-…": "uuid" }`); subsequent commands (`ElementClick`, `ElementSendKeys`, …) take the *bare* uuid.
-* **File uploads use the raw absolute path** in `ElementSendKeys` — this protocol generation has no W3C base64 file encoding (those codepoints are the legacy Selenium `NULL`/`CANCEL` keys there).
-* **Script bodies must `return`.** W3C `ExecuteScript` bodies are function *bodies*: a bare expression statement evaluates and is discarded.
-* **Marionette never awaits returned Promises.** A `return (async () => { … })()` body would serialize to `null` immediately, so `fx_eval` runs the body through a synchronous wrapper and polls `window` until the Promise settles (two-phase protocol; `wait_ms` bounds it, default 30 s).
-* **`#id` CSS selectors with digit-leading ids are invalid** (e.g. Ashby's UUID ids `#56d78818-…`). `fx_click`/`fx_type` auto-rewrite them to `[id="…"]` and report the rewrite (`used`); unsupported CSS (e.g. `:has()`) is caught in-page before the driver call with an actionable error.
-* **DOM `checked` ≠ framework form state.** Frameworks (notably Ashby) register a choice only on a real *change*. `fx_answer` therefore detects a stale pre-selected option (or an ineffective click) and runs a toggle cycle — click another option, then the target — on exclusive (radio/button) groups, re-verifying afterwards; `fx_form` aggregates radio/checkbox inputs into choice groups (question context + per-option state) so required groups can be audited in one call.
- * Marionette keeps a **persistent session across reconnects**; a crashed automation client can leave stale session state — relaunch the browser if commands queue forever.
- * **A single command must always settle.** Commands are serialized and the browser's main thread can stall (modal dialog, hung navigation), so `send()` bounds every command via `FX_MCP_CMD_TIMEOUT_MS` (default 120 s). On expiry the connection is poisoned (socket destroyed, session cleared) and the next command reconnects fresh — without that, one unanswered command wedges the entire server forever.
-  * **Socket events are per-socket.** The `error`/`close` handlers only act when `this.sock === s`. A superseded socket (dropped during a command-timeout poison) can emit *late* events after we've reconnected; reacting to them would destroy the fresh, healthy socket.
-  * **Bootstrap is a decision, not an error.** The server process == one automation session. Its first browser call probes the configured endpoint; when nothing is listening, tools return a structured `need_bootstrap` payload (isError) with the three options (launch new / connect existing / user-directed) instead of a bare `ECONNREFUSED` — the agent asks the user and acts on the choice (`FX_MCP_AUTO_LAUNCH=1` collapses it to auto-launch). `fx_status` stays a pure status report either way.
-  * **The launch port lives in prefs, never on the command line.** Firefox has no `--marionette-port` flag, so `fx_launch` creates a fresh profile and writes `user_pref("marionette.port", N)` + `user_pref("marionette.enabled", true)` to its `user.js` before `firefox --marionette --no-remote -profile <dir>`. The started pid is recorded (memory + `<profile>/.firefox-mcp-marionette-launched.json`) so `fx_shutdown` kills exactly that instance — a user-launched browser is never touched.
-
 ## Install
 
 Prerequisites: **Node.js >= 20** and **Firefox** — that's all; there are no runtime dependencies and nothing ever downloads or upgrades a browser. And the mental model: the server runs *as the child process of your MCP client* over stdio — the client spawns it per session, so there is **no daemon to install, start, or stop yourself**.
@@ -136,6 +105,37 @@ Typical flow:
 5. `fx_wait` for the next state; `fx_screenshot` + your own vision pass to verify what the DOM can't
 
 Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop checked boxes — re-verify all fields after any state change; a free-text location field is often separate from a city checkbox group; required radio groups are sometimes not wrapped in labeled field containers — audit `fx_form.groups` (and a final screenshot) instead of assuming the labeled fields are the whole form; DOM `checked` ≠ the framework's form state — trust the tools' `confirmed`/`verified` output (a stale pre-selected option is the classic failure: `fx_answer` handles it via the toggle cycle). Long application forms (e.g. Google) hide mandatory **consent/attestation checkboxes** ("…hereby certify that…", "I understand that the information I submit…") that gate the whole submit/apply: the button is left hard-disabled or the click silently no-ops until the box is ticked — that is client-side enablement, **not** bot protection; `fx_gates` surfaces these boxes (plus the disabled button and any alert banner) so you can find and check the actual gate. Material-style rows put the real `<input>` visually hidden under its own `li`/button chrome, so a direct input click can be reported "not clickable … obscured" — `fx_click`/`fx_field`/`fx_answer` recover by clicking the obscuring same-widget topmost and report it via `overlay-top:…`.
+
+## Architecture
+
+```
+ AI agent (e.g. opencode)
+        │  stdio · newline-delimited JSON-RPC 2.0
+        ▼
+  firefox-mcp-marionette (src/server.mjs)          ── tools: fx_* (29)
+        │  loopback TCP · <byteLen>:<json> frames
+        ▼
+ your Firefox (firefox --marionette)      ── your profile, your cookies
+```
+
+* `src/protocol.mjs` — pure wire codec (frame encode/parse, element-ref unwrap). No I/O, fully unit-tested.
+* `src/marionette.mjs` — async Marionette client (one socket, one session, pending-command map).
+* `src/server.mjs` — MCP stdio server + tool implementations.
+
+### Design notes (bugs that cost real debugging time)
+
+* **Frames are pure ASCII.** `JSON.stringify` does not escape `U+E000`/`U+E001` (W3C file markers) or any char ≥ `0x7F`; in UTF-8 those are multi-byte, while the length prefix is computed from string length. That desynchronizes the stream for the rest of the connection. Every frame is `\uXXXX`-escaped so declared length always equals actual bytes (regression-tested).
+* **Element refs are unwrapped.** `FindElement` replies wrap the uuid (`{ "element-…": "uuid" }`); subsequent commands (`ElementClick`, `ElementSendKeys`, …) take the *bare* uuid.
+* **File uploads use the raw absolute path** in `ElementSendKeys` — this protocol generation has no W3C base64 file encoding (those codepoints are the legacy Selenium `NULL`/`CANCEL` keys there).
+* **Script bodies must `return`.** W3C `ExecuteScript` bodies are function *bodies*: a bare expression statement evaluates and is discarded.
+* **Marionette never awaits returned Promises.** A `return (async () => { … })()` body would serialize to `null` immediately, so `fx_eval` runs the body through a synchronous wrapper and polls `window` until the Promise settles (two-phase protocol; `wait_ms` bounds it, default 30 s).
+* **`#id` CSS selectors with digit-leading ids are invalid** (e.g. Ashby's UUID ids `#56d78818-…`). `fx_click`/`fx_type` auto-rewrite them to `[id="…"]` and report the rewrite (`used`); unsupported CSS (e.g. `:has()`) is caught in-page before the driver call with an actionable error.
+* **DOM `checked` ≠ framework form state.** Frameworks (notably Ashby) register a choice only on a real *change*. `fx_answer` therefore detects a stale pre-selected option (or an ineffective click) and runs a toggle cycle — click another option, then the target — on exclusive (radio/button) groups, re-verifying afterwards; `fx_form` aggregates radio/checkbox inputs into choice groups (question context + per-option state) so required groups can be audited in one call.
+ * Marionette keeps a **persistent session across reconnects**; a crashed automation client can leave stale session state — relaunch the browser if commands queue forever.
+ * **A single command must always settle.** Commands are serialized and the browser's main thread can stall (modal dialog, hung navigation), so `send()` bounds every command via `FX_MCP_CMD_TIMEOUT_MS` (default 120 s). On expiry the connection is poisoned (socket destroyed, session cleared) and the next command reconnects fresh — without that, one unanswered command wedges the entire server forever.
+  * **Socket events are per-socket.** The `error`/`close` handlers only act when `this.sock === s`. A superseded socket (dropped during a command-timeout poison) can emit *late* events after we've reconnected; reacting to them would destroy the fresh, healthy socket.
+  * **Bootstrap is a decision, not an error.** The server process == one automation session. Its first browser call probes the configured endpoint; when nothing is listening, tools return a structured `need_bootstrap` payload (isError) with the three options (launch new / connect existing / user-directed) instead of a bare `ECONNREFUSED` — the agent asks the user and acts on the choice (`FX_MCP_AUTO_LAUNCH=1` collapses it to auto-launch). `fx_status` stays a pure status report either way.
+  * **The launch port lives in prefs, never on the command line.** Firefox has no `--marionette-port` flag, so `fx_launch` creates a fresh profile and writes `user_pref("marionette.port", N)` + `user_pref("marionette.enabled", true)` to its `user.js` before `firefox --marionette --no-remote -profile <dir>`. The started pid is recorded (memory + `<profile>/.firefox-mcp-marionette-launched.json`) so `fx_shutdown` kills exactly that instance — a user-launched browser is never touched.
 
 ## Tools
 
