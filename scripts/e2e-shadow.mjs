@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const port = Number(process.argv[2] || process.env.FX_MARIONETTE_PORT || 2829);
-const TEST_HTML = '/tmp/marionette-mcp/e2e_shadow.html';
+const TEST_HTML = '/tmp/firefox-mcp-marionette/e2e_shadow.html';
 
 fs.mkdirSync(path.dirname(TEST_HTML), { recursive: true });
 fs.writeFileSync(TEST_HTML, `<!doctype html>

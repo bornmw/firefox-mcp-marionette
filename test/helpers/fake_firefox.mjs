@@ -1,5 +1,5 @@
 // fake_firefox.mjs — stand-in `firefox` binary for fx_launch tests.
-// Mimics the parts of a real Marionette Firefox that marionette-mcp depends on:
+// Mimics the parts of a real Marionette Firefox that firefox-mcp-marionette depends on:
 //   * takes -profile <dir>
 //   * reads the `marionette.port` PREFERENCE from <profile>/user.js — proving
 //     the port must flow through prefs, not a launch flag

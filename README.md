@@ -1,4 +1,4 @@
-# marionette-mcp
+# firefox-mcp-marionette
 
 Zero-dependency [Model Context Protocol](https://modelcontextprotocol.io) server that drives a Firefox with Marionette enabled — the instance *you* launched with `--marionette` (attach-first), or a **dedicated instance the MCP starts for you** on request — via its native wire protocol.
 
@@ -18,7 +18,7 @@ Playwright's browser-automation channels (CDP, extension mode) target Chromium, 
  AI agent (e.g. opencode)
         │  stdio · newline-delimited JSON-RPC 2.0
         ▼
-  marionette-mcp (src/server.mjs)          ── tools: fx_* (29)
+  firefox-mcp-marionette (src/server.mjs)          ── tools: fx_* (29)
         │  loopback TCP · <byteLen>:<json> frames
         ▼
  your Firefox (firefox --marionette)      ── your profile, your cookies
@@ -41,7 +41,7 @@ Playwright's browser-automation channels (CDP, extension mode) target Chromium, 
  * **A single command must always settle.** Commands are serialized and the browser's main thread can stall (modal dialog, hung navigation), so `send()` bounds every command via `FX_MCP_CMD_TIMEOUT_MS` (default 120 s). On expiry the connection is poisoned (socket destroyed, session cleared) and the next command reconnects fresh — without that, one unanswered command wedges the entire server forever.
   * **Socket events are per-socket.** The `error`/`close` handlers only act when `this.sock === s`. A superseded socket (dropped during a command-timeout poison) can emit *late* events after we've reconnected; reacting to them would destroy the fresh, healthy socket.
   * **Bootstrap is a decision, not an error.** The server process == one automation session. Its first browser call probes the configured endpoint; when nothing is listening, tools return a structured `need_bootstrap` payload (isError) with the three options (launch new / connect existing / user-directed) instead of a bare `ECONNREFUSED` — the agent asks the user and acts on the choice (`FX_MCP_AUTO_LAUNCH=1` collapses it to auto-launch). `fx_status` stays a pure status report either way.
-  * **The launch port lives in prefs, never on the command line.** Firefox has no `--marionette-port` flag, so `fx_launch` creates a fresh profile and writes `user_pref("marionette.port", N)` + `user_pref("marionette.enabled", true)` to its `user.js` before `firefox --marionette --no-remote -profile <dir>`. The started pid is recorded (memory + `<profile>/.marionette-mcp-launched.json`) so `fx_shutdown` kills exactly that instance — a user-launched browser is never touched.
+  * **The launch port lives in prefs, never on the command line.** Firefox has no `--marionette-port` flag, so `fx_launch` creates a fresh profile and writes `user_pref("marionette.port", N)` + `user_pref("marionette.enabled", true)` to its `user.js` before `firefox --marionette --no-remote -profile <dir>`. The started pid is recorded (memory + `<profile>/.firefox-mcp-marionette-launched.json`) so `fx_shutdown` kills exactly that instance — a user-launched browser is never touched.
 
 ## Quick start
 
@@ -81,7 +81,7 @@ The server attaches over loopback TCP to a `firefox --marionette` instance on `F
 
   Then point the MCP at it via `FX_MARIONETTE_PORT` (opencode config) — or, if the MCP is already running, re-point it at runtime with `fx_connect {host, port}` (no restart needed).
 
-* **Verify / diagnose:** `fx_status` reports both the **active `endpoint`** and the **`configured`** endpoint. If it can't connect, the error names the port it tried and how to launch Firefox there (e.g. `ECONNREFUSED 127.0.0.1:2829` → nothing listening; launch as above). Remember Marionette serves **one active client per browser** — don't leave another marionette-mcp (or another automation) attached to the same instance.
+* **Verify / diagnose:** `fx_status` reports both the **active `endpoint`** and the **`configured`** endpoint. If it can't connect, the error names the port it tried and how to launch Firefox there (e.g. `ECONNREFUSED 127.0.0.1:2829` → nothing listening; launch as above). Remember Marionette serves **one active client per browser** — don't leave another firefox-mcp-marionette (or another automation) attached to the same instance.
 
 opencode config (opencode.json):
 
@@ -90,7 +90,7 @@ opencode config (opencode.json):
   "mcp": {
     "marionette": {
       "type": "local",
-      "command": ["node", "/absolute/path/to/marionette-mcp/src/server.mjs"],
+      "command": ["node", "/absolute/path/to/firefox-mcp-marionette/src/server.mjs"],
       "environment": {
         "FX_MARIONETTE_PORT": "2828",
         "FX_MCP_FILE_ROOTS": "/tmp,/your/projects"
@@ -116,7 +116,7 @@ Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop che
 | Tool | Purpose |
 |---|---|
 | `fx_status` | Connection, active **`endpoint`** vs `configured`, session, current page, `navigator.webdriver`. With no reachable browser it does NOT error — returns `connected:false`, the probe result, and the bootstrap options; reports `launched`/`launchedCurrent` when this server started the instance |
-| `fx_launch` | Bootstrap option 1: start a NEW dedicated Firefox — fresh profile (`<root>/marionette-mcp-<port>`), port written into `user.js` **prefs** (`marionette.port`; no CLI flag exists), `firefox --marionette --no-remote -profile <dir>`, wait for the listener, attach. Optional `{port}` (default: first free above the configured one) and `{profile}` dir. Reuse: re-calling with the same live port re-attaches, no second process |
+| `fx_launch` | Bootstrap option 1: start a NEW dedicated Firefox — fresh profile (`<root>/firefox-mcp-marionette-<port>`), port written into `user.js` **prefs** (`marionette.port`; no CLI flag exists), `firefox --marionette --no-remote -profile <dir>`, wait for the listener, attach. Optional `{port}` (default: first free above the configured one) and `{profile}` dir. Reuse: re-calling with the same live port re-attaches, no second process |
 | `fx_shutdown` | Stop an instance this server started via `fx_launch` (killed by the recorded pid; a user-launched browser is never touched). Defaults to the current endpoint |
 | `fx_connect` | Bootstrap option 2: (re-)point the MCP at an already-running loopback endpoint `{host, port}` and re-attach (env-configured default when omitted). Returns the active endpoint, the configured one, and the session |
 | `fx_navigate` | Go to a URL |
@@ -152,7 +152,7 @@ Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop che
 | `FX_MCP_CMD_TIMEOUT_MS` | `120000` | Per-command bound. A command that never settles (modal dialog, hung page) poisons the connection and auto-reconnects on the next command, so one stuck page can't wedge the whole server |
 | `FX_MCP_AUTO_LAUNCH` | off | When the first-call probe finds no reachable Firefox, `fx_launch` runs automatically instead of returning the bootstrap question |
 | `FX_MCP_FIREFOX_BIN` | auto-detect | Firefox binary for `fx_launch` / auto-launch: a path or `"cmd args"` string (e.g. `node /path/standin.mjs`); default looks up `firefox`/`firefox-esr` on PATH + common system paths |
-| `FX_MCP_PROFILE_DIR` | `~/.mozilla/firefox` | Base directory for the per-port profiles `fx_launch` creates (`marionette-mcp-<port>/`) |
+| `FX_MCP_PROFILE_DIR` | `~/.mozilla/firefox` | Base directory for the per-port profiles `fx_launch` creates (`firefox-mcp-marionette-<port>/`) |
 
 ## Security
 
@@ -174,7 +174,7 @@ npm test            # or: node --test test/*.test.mjs
 * `test/server.test.mjs` — spawns the real MCP server and drives it end-to-end (JSON-RPC plumbing, all tool paths, framing-safety under Unicode input, stdin-EOF shutdown).
 * `test/bootstrap.test.mjs` — first-trigger behavior against a stand-in "firefox" binary (`test/helpers/fake_firefox.mjs`): the no-browser decision payload, the prefs-based launch (port flows only through `user.js`), attach/reuse, `fx_shutdown` pid lifecycle, and `FX_MCP_AUTO_LAUNCH` inline bootstrap.
 
-Live-browser tests (start your own `firefox --marionette` first; note Marionette serves one active client at a time — no other marionette-mcp client may be attached):
+Live-browser tests (start your own `firefox --marionette` first; note Marionette serves one active client at a time — no other firefox-mcp-marionette client may be attached):
 
 * `npm run e2e:live` — connection, navigation, screenshot through the real wire protocol.
 * `npm run e2e:forms` — the form primitives against a self-generated test page (labels, option/state round-trips, click fallbacks, negative cases).

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Live regression test for the generic form primitives (fx_form/fx_field/fx_answer/fx_scroll).
 // Requires a user-launched `firefox --marionette` (default port 2828).
-// NOTE: Marionette serves one active client at a time — if another marionette-mcp
+// NOTE: Marionette serves one active client at a time — if another firefox-mcp-marionette
 // (e.g. a running opencode session) holds the browser socket, this test's connection
 // will be refused. Run it when no other client is attached, or restart the browser first.
 // Usage:
@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const port = Number(process.argv[2] || process.env.FX_MARIONETTE_PORT || 2828);
-const TEST_HTML = path.join(os.tmpdir(), 'marionette-mcp-form-test-' + process.pid + '.html');
+const TEST_HTML = path.join(os.tmpdir(), 'firefox-mcp-marionette-form-test-' + process.pid + '.html');
 
 fs.writeFileSync(TEST_HTML, `<!doctype html>
 <html><head><meta charset="utf-8"><title>MCP Form Test</title>
@@ -168,7 +168,7 @@ try {
   check('fx_answer: exclusive group, stale pre-selected radio -> toggle cycle ok', await call('fx_answer', { question: 'platform version', choice: 'Current' }), (t, e) => !e && t.includes('"ok": true') && t.includes('toggle'));
   check('fx_answer: toggle cycle registered the framework state (__reg)', await call('fx_eval', { js: 'return window.__reg && window.__reg.ver;' }), (t) => t.includes('Current'));
   check('fx_snapshot: label captured as lbl=', await call('fx_snapshot', {}), (t) => t.includes('lbl="Full Name"'));
-  const shot = '/tmp/marionette-mcp/e2e_full.png';
+  const shot = '/tmp/firefox-mcp-marionette/e2e_full.png';
   check('fx_screenshot: full-page PNG (IHDR height beyond viewport)', await call('fx_screenshot', { path: shot }), (t) => {
     try { const b = fs.readFileSync(shot); return b.length > 100 && b.readUInt32BE(16) > 0 && b.readUInt32BE(20) > 1500; } catch { return false; }
   });

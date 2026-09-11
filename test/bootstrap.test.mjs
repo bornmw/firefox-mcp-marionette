@@ -135,7 +135,7 @@ test('fx_launch writes the port into user.js prefs, starts the instance, attache
     const userJs = fs.readFileSync(path.join(l.profile, 'user.js'), 'utf8');
     assert.match(userJs, /user_pref\("marionette\.enabled", true\)/);
     assert.match(userJs, new RegExp('user_pref\\("marionette\\.port", ' + l.port + '\\)'));
-    assert.ok(fs.existsSync(path.join(l.profile, '.marionette-mcp-launched.json')), 'state file written');
+    assert.ok(fs.existsSync(path.join(l.profile, '.firefox-mcp-marionette-launched.json')), 'state file written');
 
     // now attached to the new endpoint; commands reach the fake browser
     const st = JSON.parse(toolText(await s.rpc({ jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'fx_status', arguments: {} } })));

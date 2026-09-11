@@ -48,7 +48,7 @@ before(async () => {
       ...process.env,
       FX_MARIONETTE_HOST: '127.0.0.1',
       FX_MARIONETTE_PORT: String(fake.port),
-      FX_MCP_FILE_ROOTS: '/tmp/marionette-mcp-test-roots',
+      FX_MCP_FILE_ROOTS: '/tmp/firefox-mcp-marionette-test-roots',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -74,7 +74,7 @@ test('initialize returns server identity and echoes protocol version', async () 
   const r = await rpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 't', version: '0' } } });
   assert.ok(r, 'no response');
   assert.equal(r.result.protocolVersion, '2025-03-26');
-  assert.equal(r.result.serverInfo.name, 'marionette-mcp');
+  assert.equal(r.result.serverInfo.name, 'firefox-mcp-marionette');
   assert.ok(r.version === undefined && r.result.serverInfo.version, 'version reported');
 });
 
@@ -203,7 +203,7 @@ test('fx_upload rejects paths outside allowed roots', async () => {
 });
 
 test('fx_upload accepts a path under the allowed root', async () => {
-  const dir = '/tmp/marionette-mcp-test-roots';
+  const dir = '/tmp/firefox-mcp-marionette-test-roots';
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, 'upload.csv');
   fs.writeFileSync(file, 'a,b\n1,2\n');
@@ -215,10 +215,10 @@ test('fx_upload accepts a path under the allowed root', async () => {
 });
 
 test('fx_screenshot writes a file under an allowed root', async () => {
-  const r = await rpc({ jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'fx_screenshot', arguments: { path: '/tmp/marionette-mcp-test-roots/shot.png' } } });
+  const r = await rpc({ jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'fx_screenshot', arguments: { path: '/tmp/firefox-mcp-marionette-test-roots/shot.png' } } });
   const t = toolText(r);
   assert.match(t, /shot\.png/);
-  assert.ok(fs.existsSync('/tmp/marionette-mcp-test-roots/shot.png'));
+  assert.ok(fs.existsSync('/tmp/firefox-mcp-marionette-test-roots/shot.png'));
 });
 
 test('fx_wait on visible text resolves quickly', async () => {

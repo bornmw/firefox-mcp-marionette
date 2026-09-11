@@ -26,7 +26,7 @@ try {
   console.log('navigated to:', after.value);
 
   const shot = await m.cmd('WebDriver:TakeScreenshot', {});
-  const out = '/tmp/marionette-mcp-live-shot.png';
+  const out = '/tmp/firefox-mcp-marionette-live-shot.png';
   fs.mkdirSync('/tmp', { recursive: true });
   fs.writeFileSync(out, Buffer.from(String(shot.value), 'base64'));
   console.log('screenshot:', out);

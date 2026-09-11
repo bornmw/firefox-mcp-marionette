@@ -26,7 +26,7 @@ const PORT = Number(process.env.FX_MARIONETTE_PORT || 2828);
 const FILE_ROOTS = (process.env.FX_MCP_FILE_ROOTS || '/tmp').split(',').map((s) => s.trim()).filter(Boolean);
 // Bootstrap (first-trigger) launch settings. fx_launch/autolaunch create a DEDICATED
 // profile and set the port via user.js PREFS — there is no --marionette-port CLI flag.
-function defaultProfileRoot() { try { return path.join(os.homedir(), '.mozilla', 'firefox'); } catch { return '/tmp/marionette-mcp-profiles'; } }
+function defaultProfileRoot() { try { return path.join(os.homedir(), '.mozilla', 'firefox'); } catch { return '/tmp/firefox-mcp-marionette-profiles'; } }
 const PROFILE_ROOT = process.env.FX_MCP_PROFILE_DIR || defaultProfileRoot();
 const AUTO_LAUNCH = /^(1|true|yes)$/i.test(process.env.FX_MCP_AUTO_LAUNCH || '');
 const FIREFOX_BIN = process.env.FX_MCP_FIREFOX_BIN || ''; // "cmd [args]" — e.g. a test stand-in
@@ -672,7 +672,7 @@ const TOOLS = [
       ...launched,
     };
   }),
-  T('fx_launch', 'Bootstrap option 1 — start a NEW dedicated Firefox with Marionette: a fresh profile on a NEW port, with the port set through the profile user.js PREFERENCES (user_pref marionette.port / marionette.enabled — Firefox has no --marionette-port CLI flag, so this is the only way to move it off the default 2828), then `firefox --marionette --no-remote -profile <dir>`, and attach to it. The instance starts empty (no cookies/logins from your daily profile). Port defaults to the first free port above the configured one. Binary: FX_MCP_FIREFOX_BIN env (e.g. "node /path/standin.mjs") or firefox on PATH / common system paths. Returns the started pid, port, and profile, and leaves the MCP attached to the new instance.', { port: { type: 'number', description: 'marionette port; default = first free port above the configured one' }, profile: { type: 'string', description: 'profile directory; default <profile root>/marionette-mcp-<port>' } }, async (a) => {
+  T('fx_launch', 'Bootstrap option 1 — start a NEW dedicated Firefox with Marionette: a fresh profile on a NEW port, with the port set through the profile user.js PREFERENCES (user_pref marionette.port / marionette.enabled — Firefox has no --marionette-port CLI flag, so this is the only way to move it off the default 2828), then `firefox --marionette --no-remote -profile <dir>`, and attach to it. The instance starts empty (no cookies/logins from your daily profile). Port defaults to the first free port above the configured one. Binary: FX_MCP_FIREFOX_BIN env (e.g. "node /path/standin.mjs") or firefox on PATH / common system paths. Returns the started pid, port, and profile, and leaves the MCP attached to the new instance.', { port: { type: 'number', description: 'marionette port; default = first free port above the configured one' }, profile: { type: 'string', description: 'profile directory; default <profile root>/firefox-mcp-marionette-<port>' } }, async (a) => {
     const l = await doLaunch(a || {});
     return {
       ok: true,
@@ -692,7 +692,7 @@ const TOOLS = [
     for (const p of ports) {
       let rec = LAUNCHED.get(p);
       if (!rec) {
-        const f = path.join(PROFILE_ROOT, 'marionette-mcp-' + p, '.marionette-mcp-launched.json');
+        const f = path.join(PROFILE_ROOT, 'firefox-mcp-marionette-' + p, '.firefox-mcp-marionette-launched.json');
         if (fs.existsSync(f)) { try { rec = JSON.parse(fs.readFileSync(f, 'utf8')); } catch { rec = null; } }
       }
       if (!rec) continue;
@@ -1184,7 +1184,7 @@ const TOOLS = [
     }
   }),
   T('fx_screenshot', 'Full-page PNG (Marionette captures the entire scrollable document, not just the viewport) to a file under an allowed root (or explicit allowed path)', { path: { type: 'string' } }, async (a) => {
-    const dest = a.path || '/tmp/marionette-mcp/shot_' + Date.now() + '.png';
+    const dest = a.path || '/tmp/firefox-mcp-marionette/shot_' + Date.now() + '.png';
     const abs = path.resolve(dest);
     if (!allowedPath(abs)) throw new Error('path outside allowed roots');
     fs.mkdirSync(path.dirname(abs), { recursive: true });
@@ -1363,7 +1363,7 @@ async function launchInstance({ port, profile }) {
   child.unref();
   const rec = { pid: child.pid, profile, ts: new Date().toISOString() };
   LAUNCHED.set(port, rec);
-  try { fs.writeFileSync(path.join(profile, '.marionette-mcp-launched.json'), JSON.stringify(rec, null, 1) + '\n'); } catch { /* best effort */ }
+  try { fs.writeFileSync(path.join(profile, '.firefox-mcp-marionette-launched.json'), JSON.stringify(rec, null, 1) + '\n'); } catch { /* best effort */ }
   const t0 = Date.now();
   let up = false;
   while (Date.now() - t0 < 30000 && !up) {
@@ -1390,7 +1390,7 @@ async function doLaunch(args) {
   let port = args.port != null ? Number(args.port) : undefined;
   if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new Error('port must be an integer 1..65535');
   if (port === undefined) port = await pickFreePort();
-  const profile = args.profile != null ? path.resolve(String(args.profile)) : path.join(PROFILE_ROOT, 'marionette-mcp-' + port);
+  const profile = args.profile != null ? path.resolve(String(args.profile)) : path.join(PROFILE_ROOT, 'firefox-mcp-marionette-' + port);
   const ours = LAUNCHED.get(port);
   if (ours && pidAlive(ours.pid) && await portOpen('127.0.0.1', port)) {
     M.host = '127.0.0.1';
@@ -1420,7 +1420,7 @@ async function handle(obj) {
       result = {
         protocolVersion: (params && params.protocolVersion) || '2025-03-26',
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'marionette-mcp', version: VERSION },
+        serverInfo: { name: 'firefox-mcp-marionette', version: VERSION },
       };
     } else if (method === 'ping') {
       result = {};
@@ -1508,4 +1508,4 @@ function enqueue(chunk) {
 
 process.stdin.on('data', enqueue);
 process.stdin.on('end', () => { stdinEof = true; drain(); });
-log('marionette-mcp ready on', HOST + ':' + PORT, 'file roots:', FILE_ROOTS.join(' '), 'autoLaunch:', AUTO_LAUNCH, 'profileRoot:', PROFILE_ROOT);
+log('firefox-mcp-marionette ready on', HOST + ':' + PORT, 'file roots:', FILE_ROOTS.join(' '), 'autoLaunch:', AUTO_LAUNCH, 'profileRoot:', PROFILE_ROOT);

@@ -1,11 +1,11 @@
 {
-  "name": "marionette-mcp",
+  "name": "firefox-mcp-marionette",
   "version": "0.8.0",
   "description": "Zero-dependency Model Context Protocol server that drives your own Firefox (user-launched, --marionette) — or boots a dedicated loopback-only instance for the session on request — via its native wire protocol: snapshot, click, type, upload, screenshot, JS eval.",
   "type": "module",
   "main": "src/server.mjs",
   "bin": {
-    "marionette-mcp": "src/server.mjs"
+    "firefox-mcp-marionette": "src/server.mjs"
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
