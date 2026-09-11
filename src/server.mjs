@@ -3,11 +3,18 @@
 // Marionette (firefox --marionette, default port 2828) via its native wire
 // protocol.
 //
-// ATTACH-FIRST: it connects to an instance that exists. When the first browser
-// call of a session finds no reachable Firefox, the tool does not fail with a
-// raw ECONNREFUSED — it returns a bootstrap decision (fx_launch a new dedicated
-// instance / fx_connect to an existing one / the user's own direction) that the
-// agent relays to the user.
+// FIRST-TRIGGER GATE: when the session has no committed browser yet, the first
+// browser call probes the configured endpoint with a short NON-INVASIVE
+// connection (open TCP, expect the Marionette hello, close — the probe never
+// opens a session, so it cannot count as the browser's active client). Then:
+//   * a Firefox answers        -> `browser-detected` decision: attach via
+//     fx_connect, launch a dedicated instance via fx_launch, or user-directed.
+//   * nothing is reachable     -> `need_bootstrap` decision: fx_launch /
+//     fx_connect / user's own direction (FX_MCP_AUTO_LAUNCH=1 auto-launches).
+//   * a held instance drops it -> `busy-other-client` decision (Marionette
+//     serves ONE active client per browser).
+// Once an endpoint is committed (user-chosen fx_connect, fx_launch, or
+// auto-launch), later reconnects within the session are silent.
 //
 // MCP transport: newline-delimited JSON-RPC 2.0 on stdin/stdout; stderr = logs.
 // Zero runtime dependencies (Node >= 20).
@@ -18,7 +25,7 @@ import path from 'node:path';
 import net from 'node:net';
 import { spawn, spawnSync } from 'node:child_process';
 import { Marionette } from './marionette.mjs';
-import { unwrapElementRef } from './protocol.mjs';
+import { unwrapElementRef, frameKind } from './protocol.mjs';
 import { EVAL_WRAP, EVAL_POLL } from './evalwrap.mjs';
 
 const HOST = process.env.FX_MARIONETTE_HOST || '127.0.0.1';
@@ -646,33 +653,36 @@ function fmtField(f) {
 const T = (name, desc, schema, fn) => ({ name, description: desc, inputSchema: { type: 'object', properties: schema, additionalProperties: false }, fn });
 
 const TOOLS = [
-  T('fx_status', 'Health: connection, session, active + configured endpoint, current page, navigator.webdriver flag. When no Marionette Firefox is reachable it does NOT error — it reports connected:false with the probe result and the bootstrap options (start a new instance / connect an existing one).', {}, async () => {
+  T('fx_status', 'Health: connection, session, active + configured endpoint, current page, navigator.webdriver flag. Never opens a session on its own: with no committed endpoint it probes non-invasively (TCP connect, expect the Marionette hello, close) and reports connected:false with the probe result and decision options; with a committed endpoint it attaches/re-attaches and reports live state. Reports launched/launchedCurrent when this server started the instance. When the result contains a `bootstrap` decision, present its question/options to the user and act only on THEIR choice.', {}, async () => {
     const launched = launchedInfo();
-    try {
-      await ensureConn();
-    } catch (e) {
-      const probe = classifyConnError(e);
+    if (isApproved()) {
+      try { await ensureConn(); } catch { /* reported via the probe below */ }
+    }
+    if (connected && M.sock && !M.sock.destroyed && M.sessionId) {
+      const pi = await pageInfo();
       return {
-        connected: false,
+        connected: true,
         endpoint: { host: M.host, port: M.port },
         configured: { host: HOST, port: PORT },
-        probe,
-        bootstrap: bootstrapOptions(probe),
+        protocol: M.hello && M.hello.marionetteProtocol,
+        session: M.sessionId,
+        ...pi,
         ...launched,
       };
     }
-    const pi = await pageInfo();
+    const probe = await probeEndpoint(M.host, M.port);
     return {
-      connected: true,
+      connected: false,
       endpoint: { host: M.host, port: M.port },
       configured: { host: HOST, port: PORT },
-      protocol: M.hello && M.hello.marionetteProtocol,
-      session: M.sessionId,
-      ...pi,
+      probe: probe.kind,
+      ...(probe.detail ? { detail: probe.detail } : {}),
+      ...(probe.kind === 'browser-detected' ? { detected: { host: M.host, port: M.port, ...(probe.protocol != null ? { protocol: probe.protocol } : {}) } } : {}),
+      bootstrap: bootstrapOptions(probe.kind),
       ...launched,
     };
   }),
-  T('fx_launch', 'Bootstrap option 1 — start a NEW dedicated Firefox with Marionette: a fresh profile on a NEW port, with the port set through the profile user.js PREFERENCES (user_pref marionette.port / marionette.enabled — Firefox has no --marionette-port CLI flag, so this is the only way to move it off the default 2828), then `firefox --marionette --no-remote -profile <dir>`, and attach to it. The instance starts empty (no cookies/logins from your daily profile). Port defaults to the first free port above the configured one. Binary: FX_MCP_FIREFOX_BIN env (e.g. "node /path/standin.mjs") or firefox on PATH / common system paths. Returns the started pid, port, and profile, and leaves the MCP attached to the new instance.', { port: { type: 'number', description: 'marionette port; default = first free port above the configured one' }, profile: { type: 'string', description: 'profile directory; default <profile root>/firefox-mcp-marionette-<port>' } }, async (a) => {
+  T('fx_launch', 'Bootstrap option 1 — start a NEW dedicated Firefox with Marionette: a fresh profile on a NEW port, with the port set through the profile user.js PREFERENCES (user_pref marionette.port / marionette.enabled — Firefox has no --marionette-port CLI flag, so this is the only way to move it off the default 2828), then `firefox --marionette --no-remote -profile <dir>`, and attach to it. The instance starts empty (no cookies/logins from your daily profile). Port defaults to the first free port above the configured one. Binary: FX_MCP_FIREFOX_BIN env (e.g. "node /path/standin.mjs") or firefox on PATH / common system paths. Returns the started pid, port, and profile, and leaves the MCP attached to the new instance. Run it only when the user chose this option from a decision payload or explicitly asked to start a new browser — never as a silent fallback when the configured endpoint is busy.', { port: { type: 'number', description: 'marionette port; default = first free port above the configured one' }, profile: { type: 'string', description: 'profile directory; default <profile root>/firefox-mcp-marionette-<port>' } }, async (a) => {
     const l = await doLaunch(a || {});
     return {
       ok: true,
@@ -706,11 +716,12 @@ const TOOLS = [
         connected = false;
       }
       LAUNCHED.delete(p);
+      if (attachApproved && attachApproved.host === '127.0.0.1' && attachApproved.port === p) attachApproved = null;
       return { ok: true, stopped: alive, pid: rec.pid, port: p, profile: rec.profile, note: alive ? 'SIGTERM sent' : 'already gone (stale record cleared)' };
     }
     throw new Error('no fx_launch-managed instance recorded for port ' + ports.join(',') + ' — only browsers started by this server can be stopped; a Firefox you start yourself stays yours');
   }),
-  T('fx_connect', 'Point the MCP at a Firefox endpoint (host/port) and (re)attach. Marionette serves ONE client per browser, so use a dedicated instance per automation — the env-configured default (FX_MARIONETTE_HOST/PORT) is used when both args are omitted. Loopback only (by design). Returns the active endpoint + session after (re)attach.', { host: { type: 'string', description: 'loopback host, default 127.0.0.1' }, port: { type: 'number', description: 'marionette port, default = configured env port' } }, async (a) => {
+  T('fx_connect', 'Point the MCP at a Firefox endpoint (host/port) and attach — this is how a running browser detected at the first-trigger probe gets committed (and how to re-point at runtime). Marionette serves ONE client per browser, so use a dedicated instance per automation — the env-configured default (FX_MARIONETTE_HOST/PORT) is used when both args are omitted. Loopback only (by design). Committing an endpoint makes later in-session reconnects silent. Returns the active endpoint + session; a failed attach returns the probe result + options instead of a raw error. Call it only after the user chose/approved it (a decision-payload option or their explicit direction).', { host: { type: 'string', description: 'loopback host, default 127.0.0.1' }, port: { type: 'number', description: 'marionette port, default = configured env port' } }, async (a) => {
     if (a.host !== undefined) {
       const h = String(a.host);
       if (!/^(127\.\d{1,3}\.\d{1,3}\.\d{1,3}|localhost|::1)$/.test(h)) throw new Error('host must be loopback (127.x / localhost / ::1)');
@@ -726,7 +737,21 @@ const TOOLS = [
     M.sessionId = null;
     M.pending.clear();
     connected = false;
-    await ensureConn();
+    try {
+      await ensureConn();
+    } catch (e) {
+      const probe = classifyConnError(e);
+      return {
+        ok: false,
+        need_bootstrap: true,
+        probe,
+        error: String((e && e.message) || e),
+        endpoint: { host: M.host, port: M.port },
+        configured: { host: HOST, port: PORT },
+        ...bootstrapOptions(probe),
+      };
+    }
+    attachApproved = { host: M.host, port: M.port };
     return { ok: true, endpoint: { host: M.host, port: M.port }, configured: { host: HOST, port: PORT }, session: M.sessionId, protocol: M.hello && M.hello.marionetteProtocol };
   }),
   T('fx_navigate', 'Navigate the active tab to a URL', { url: { type: 'string' } }, async (a) => {
@@ -1241,41 +1266,124 @@ function toolResult(payload, opts) {
   return { content: [{ type: 'text', text: String(payload ?? '') }], isError };
 }
 
-// ---------------- bootstrap: no reachable Firefox yet ----------------
+// ---------------- bootstrap: first-trigger decisions (probe, then ask) ----------------
 // The stdio server process lives with one automation session (e.g. one opencode
-// session). Its first browser call probes the configured endpoint; when no
-// Marionette Firefox is reachable, the tool does not fail with a raw error — it
-// returns a structured DECISION payload (isError) with three options, and the
-// agent asks the user which one: start a NEW dedicated instance (fx_launch,
-// port set via profile user.js PREFERENCES — there is no --marionette-port
-// flag), attach to an ALREADY-RUNNING instance (fx_connect with host/port the
-// user provides), or do something else (user-directed). fx_status is exempt
-// and always reports state; fx_launch/fx_shutdown/fx_connect act on it.
+// session). Its first browser call probes the configured endpoint NON-INVASIVELY
+// (probeEndpoint: open TCP, expect the Marionette hello, close — no session is
+// opened, so the probe never counts as an active client and never displaces a
+// second client). Outcomes:
+//   * 'browser-detected'        -> structured decision: attach via fx_connect /
+//                                  launch a NEW dedicated instance via fx_launch
+//                                  (fresh profile, port via profile user.js PREFERENCES —
+//                                  there is no --marionette-port flag) / user-directed
+//   * 'nothing-listening'       -> same decision payload (fx_launch / fx_connect /
+//                                  user-directed); FX_MCP_AUTO_LAUNCH=1 auto-launches
+//   * 'busy-other-client'       -> the browser already holds another active client;
+//                                  the agent asks how to proceed
+// Once an endpoint is committed (user-chosen fx_connect, fx_launch, or
+// auto-launch via attachApproved), later reconnects in the session are silent.
+// fx_status is exempt and never attaches on its own; fx_launch/fx_shutdown/
+// fx_connect act on the decisions.
 const BOOTSTRAP_EXEMPT = new Set(['fx_status', 'fx_connect', 'fx_launch', 'fx_shutdown']);
 
 function classifyConnError(e) {
   const m = String((e && e.message) || e);
   if (/nothing is listening|econnrefused|refused/i.test(m)) return 'nothing-listening';
-  if (/econnreset|reset/i.test(m)) return 'busy-other-client';
+  // A held instance drops the socket cleanly (no ECONNRESET) when it rejects a
+  // second client — "socket closed" / "connection lost" are THIS case, not "error".
+  if (/econnreset|socket closed|connection lost|not connected/i.test(m)) return 'busy-other-client';
   if (/timeout|err_socket/i.test(m)) return 'timeout';
   return 'error';
 }
 
+// Endpoint this session has already committed to (user chose fx_connect for a
+// detected browser, fx_launch started one, or auto-launch booted one). While it
+// matches M.host:port, reconnects after hiccups are silent — no re-asking.
+let attachApproved = null;
+function isApproved() {
+  return !!(attachApproved && attachApproved.host === M.host && attachApproved.port === M.port);
+}
+
+// Non-invasive endpoint probe: open a throwaway TCP connection, wait for the
+// Marionette hello frame, ALWAYS close the socket. Never opens a session, so the
+// probe cannot count as the browser's active client (safe even when another
+// automation holds the instance). resolve():
+//   { kind: 'nothing-listening' }        — ECONNREFUSED etc.
+//   { kind: 'browser-detected', protocol }— hello received: live Marionette, no session
+//   { kind: 'busy-other-client', detail }— accepted then dropped (held by another client)
+//   { kind: 'unknown-listener',   detail }— open but no hello (not Marionette)
+//   { kind: 'probe-failed',       detail }— connect timeout / other errors
+function probeEndpoint(host, port, { connectMs = 2000, helloMs = 3000 } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    let buf = Buffer.alloc(0);
+    const s = net.connect(port, host);
+    const finish = (kind, extra) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      try { s.destroy(); } catch { /* ignore */ }
+      resolve(Object.assign({ kind }, extra || {}));
+    };
+    timer = setTimeout(() => finish('probe-failed', { detail: 'no TCP connection to ' + host + ':' + port + ' within ' + connectMs + ' ms' }), connectMs);
+    s.on('error', (e) => {
+      const what = String((e && e.code) || (e && e.message) || e);
+      if (/(ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ECONNABORTED)/i.test(what)) finish('nothing-listening');
+      else if (/ECONNRESET/i.test(what)) finish('busy-other-client', { detail: 'connection reset during handshake' });
+      else finish('probe-failed', { detail: what });
+    });
+    s.once('connect', () => {
+      timer = setTimeout(() => finish('unknown-listener', { detail: 'port ' + host + ':' + port + ' is open but sent no Marionette hello' }), helloMs);
+    });
+    s.on('data', (d) => {
+      if (settled) return;
+      buf = Buffer.concat([buf, d]);
+      const colon = buf.indexOf(':');
+      if (colon < 0) return;
+      const prefix = buf.subarray(0, colon).toString('ascii');
+      const len = /^\d+$/.test(prefix) ? Number(prefix) : NaN;
+      if (!Number.isSafeInteger(len) || len < 0 || buf.length < colon + 1 + len) return;
+      let frame = null;
+      try { frame = JSON.parse(buf.subarray(colon + 1, colon + 1 + len).toString('utf8')); } catch { return; }
+      if (frame && frameKind(frame) === 'hello') finish('browser-detected', { protocol: frame.marionetteProtocol });
+    });
+    s.on('close', () => finish('busy-other-client', { detail: 'connection closed during handshake — another client likely holds this instance' }));
+  });
+}
+
+// Agent-directed relay rule, shipped with EVERY decision payload: the browser
+// choice belongs to the user, not to the agent. The agent must present the
+// question and wait for the user's explicit choice before acting.
+const RELAY_INSTRUCTION = 'This decision belongs to the USER, not to you: present the question and the options above to the user (a user-question tool if your client offers one, otherwise plain text) and wait for their explicit choice. Do not pick an option, call fx_launch or fx_connect, or run any browser tool on your own judgment — the user decides which browser this session uses.';
+
 function bootstrapOptions(probe) {
   const where = M.host + ':' + M.port;
+  if (probe === 'browser-detected') {
+    return {
+      question: 'A Marionette-enabled Firefox is already running on ' + where + ' and answered the probe. This session has no browser yet — do you want to use that instance?',
+      instruction: RELAY_INSTRUCTION,
+      options: [
+        { id: 1, tool: 'fx_connect', do: 'Attach to the detected browser: fx_connect {host: "' + M.host + '", port: ' + M.port + '}. This commits that endpoint for the session; later reconnects are silent.' },
+        { id: 2, tool: 'fx_launch', do: 'Start a NEW dedicated Firefox instead — fresh profile on a NEW port (port written to user.js prefs, no CLI flag). The detected instance keeps running, untouched.' },
+        { id: 3, tool: null, do: 'Something else: point at a different endpoint (fx_connect {host, port}), reconfigure FX_MARIONETTE_HOST/PORT, or stop that browser first.' },
+      ],
+    };
+  }
   let question;
   let option2;
   if (probe === 'busy-other-client') {
     question = 'Something answers on ' + where + ' but drops the connection — a Marionette browser there likely already holds another active client (Marionette serves ONE client per browser). What should I do?';
     option2 = { id: 2, tool: 'fx_connect', do: 'Free the other client (or ask the user to close it / point at the right port), then re-attach: fx_connect {host, port}.' };
   } else {
-    question = probe === 'timeout'
-      ? 'Could not complete a connection to ' + where + ' in time — nothing usable is listening there. What should I do?'
+    question = probe === 'timeout' || probe === 'unknown-listener' || probe === 'probe-failed'
+      ? 'Could not complete a connection to ' + where + ' — nothing usable is listening there. What should I do?'
       : 'No Marionette-enabled Firefox is reachable on ' + where + ' — this session has no browser yet. What should I do?';
     option2 = { id: 2, tool: 'fx_connect', do: 'Connect to an ALREADY-RUNNING Firefox: ask the user for its loopback {host, port} (port 2828 → plain `firefox --marionette`; custom port → that port must be set in the profile user.js, as user_pref("marionette.port", N)) and call fx_connect {host, port}.' };
   }
   return {
     question,
+    instruction: RELAY_INSTRUCTION,
     options: [
       { id: 1, tool: 'fx_launch', do: 'Start a NEW dedicated Firefox: fresh profile on a NEW port, the port written to the profile user.js pref marionette.port (no CLI flag exists for it). fx_launch {} auto-picks a free port; fx_launch {port} picks a specific one. It will start empty — no cookies/logins from your daily profile.' },
       option2,
@@ -1401,12 +1509,14 @@ async function doLaunch(args) {
     M.pending.clear();
     connected = false;
     await ensureConn();
+    attachApproved = { host: '127.0.0.1', port };
     return { started: 'reused-launched', pid: ours.pid, port, profile: ours.profile };
   }
   if (await portOpen('127.0.0.1', port)) {
     throw new Error('port ' + port + ' is already in use by something else — pick another port, or use fx_connect {host: "127.0.0.1", port: ' + port + '} to attach to it');
   }
   const rec = await launchInstance({ port, profile });
+  attachApproved = { host: '127.0.0.1', port };
   return { started: 'new-instance', pid: rec.pid, port, profile };
 }
 
@@ -1432,16 +1542,29 @@ async function handle(obj) {
       let payload;
       let autoStarted = null;
       if (!BOOTSTRAP_EXEMPT.has(tool.name)) {
-        try {
-          await ensureConn();
-        } catch (e) {
-          const probe = classifyConnError(e);
-          if (probe === 'error') throw e;
-          if (AUTO_LAUNCH && probe === 'nothing-listening') {
+        const active = connected && M.sock && !M.sock.destroyed && M.sessionId;
+        if (!active && !isApproved()) {
+          const probe = await probeEndpoint(M.host, M.port);
+          if (probe.kind === 'nothing-listening' && AUTO_LAUNCH) {
             const l = await doLaunch({});
             autoStarted = { started: l.started, pid: l.pid, port: l.port, profile: l.profile };
             // fall through: the tool now runs against the freshly started instance
           } else {
+            payload = {
+              ok: false,
+              need_bootstrap: true,
+              probe: probe.kind,
+              endpoint: { host: M.host, port: M.port },
+              ...(probe.protocol != null ? { detected: { host: M.host, port: M.port, protocol: probe.protocol } } : {}),
+              ...(probe.detail ? { detail: probe.detail } : {}),
+              ...bootstrapOptions(probe.kind),
+            };
+          }
+        }
+        if (payload === undefined) {
+          try { await ensureConn(); } catch (e) {
+            const probe = classifyConnError(e);
+            if (probe === 'error') throw e;
             payload = { ok: false, need_bootstrap: true, probe, endpoint: { host: M.host, port: M.port }, ...bootstrapOptions(probe) };
           }
         }

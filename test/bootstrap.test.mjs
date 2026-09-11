@@ -1,6 +1,11 @@
-// bootstrap.test.mjs — first-trigger bootstrap behavior:
+// bootstrap.test.mjs — first-trigger behavior:
 //   * no reachable Firefox on the configured endpoint → fx_status reports the
 //     state (no error) and the other tools return the 3-option decision payload
+//   * a reachable Firefox on the configured endpoint → tools return the
+//     browser-detected decision (attach via fx_connect / launch new / other);
+//     nothing attaches until fx_connect commits the endpoint
+//   * a held instance that drops the handshake → busy-other-client decision
+//     (no raw errors)
 //   * fx_launch starts a stand-in "firefox" whose listener port comes ONLY from
 //     the profile user.js prefs (no launch flag exists), attaches to it, and
 //     fx_shutdown stops exactly that pid
@@ -13,6 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
+import { startFakeMarionette } from './helpers/fake_marionette.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const serverPath = path.join(here, '..', 'src', 'server.mjs');
@@ -85,6 +91,7 @@ test('no browser: fx_status reports the decision, tools return the 3-option payl
     assert.equal(st.bootstrap.options.length, 3);
     assert.deepEqual(st.bootstrap.options.map((o) => o.tool), ['fx_launch', 'fx_connect', null]);
     assert.match(st.bootstrap.options[0].do, /user\.js/);
+    assert.ok(st.bootstrap.instruction, 'decision payload carries the relay-to-user instruction');
     assert.equal(st.launched.length, 0);
 
     // a real browser tool: isError + need_bootstrap with the same options
@@ -95,6 +102,7 @@ test('no browser: fx_status reports the decision, tools return the 3-option payl
     assert.equal(p.ok, false);
     assert.equal(p.endpoint.port, dead);
     assert.equal(p.options.length, 3);
+    assert.ok(p.instruction, 'decision payload carries the relay-to-user instruction');
     assert.match(toolErr(r1, /fx_launch/), /fx_connect/);
 
     // fx_shutdown: nothing launched yet → refuses
@@ -198,5 +206,88 @@ test('FX_MCP_AUTO_LAUNCH skips the question and runs the call against the new in
     if (pid) { try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }
     await stop(s);
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('running browser detected: nothing auto-attaches; fx_connect commits, then calls run', async () => {
+  const fake = await startFakeMarionette(0);
+  const s = await startServer({
+    FX_MARIONETTE_HOST: '127.0.0.1',
+    FX_MARIONETTE_PORT: String(fake.port),
+  });
+  try {
+    // fx_status only probes: detects the live browser without opening a session
+    const r0 = await s.rpc({ jsonrpc: '2.0', id: 50, method: 'tools/call', params: { name: 'fx_status', arguments: {} } });
+    assert.equal(r0.result.isError, false, 'fx_status is a status report: ' + toolText(r0));
+    const st = JSON.parse(toolText(r0));
+    assert.equal(st.connected, false, 'probe must not open a session');
+    assert.equal(st.probe, 'browser-detected');
+    assert.equal(st.detected.port, fake.port);
+    assert.deepEqual(st.bootstrap.options.map((o) => o.tool), ['fx_connect', 'fx_launch', null]);
+
+    // a regular browser tool must ask, not attach on its own
+    const r1 = await s.rpc({ jsonrpc: '2.0', id: 51, method: 'tools/call', params: { name: 'fx_page', arguments: {} } });
+    assert.equal(r1.result.isError, true, 'asks instead of attaching: ' + toolText(r1));
+    const p = JSON.parse(toolText(r1));
+    assert.equal(p.need_bootstrap, true);
+    assert.equal(p.probe, 'browser-detected');
+    assert.equal(p.detected.port, fake.port);
+    assert.ok(p.question, 'question present');
+    assert.ok(p.instruction, 'decision payload carries the relay-to-user instruction');
+    assert.ok(!fake.state.frames.some((f) => f && f[2] === 'WebDriver:NewSession'), 'no session opened without approval');
+
+    // user picks "attach to the detected browser" → endpoint committed
+    const r2 = await s.rpc({ jsonrpc: '2.0', id: 52, method: 'tools/call', params: { name: 'fx_connect', arguments: {} } });
+    assert.equal(r2.result.isError, false, 'fx_connect: ' + toolText(r2));
+    const c = JSON.parse(toolText(r2));
+    assert.equal(c.ok, true);
+    assert.equal(c.session, 'fake-sess-1');
+
+    // committed: the same call now runs without another question
+    const r3 = await s.rpc({ jsonrpc: '2.0', id: 53, method: 'tools/call', params: { name: 'fx_page', arguments: {} } });
+    assert.equal(r3.result.isError, false, toolText(r3));
+    assert.match(toolText(r3), /fake\.test/);
+    const st2 = JSON.parse(toolText(await s.rpc({ jsonrpc: '2.0', id: 54, method: 'tools/call', params: { name: 'fx_status', arguments: {} } })));
+    assert.equal(st2.connected, true);
+    assert.equal(st2.session, 'fake-sess-1');
+  } finally {
+    fake.closeAll();
+    await fake.stop();
+    await stop(s);
+  }
+});
+
+test('browser held by another client (handshake dropped) → busy-other-client decision, not a raw error', async () => {
+  // Stand-in for a Marionette instance already held by another client:
+  // accepts the TCP connection, then closes it without sending the hello.
+  const busySocks = new Set();
+  const busy = net.createServer((sock) => {
+    busySocks.add(sock);
+    sock.on('close', () => busySocks.delete(sock));
+    setTimeout(() => { try { sock.end(); } catch { /* gone */ } }, 50);
+  });
+  await new Promise((r) => busy.listen(0, '127.0.0.1', r));
+  const s = await startServer({
+    FX_MARIONETTE_HOST: '127.0.0.1',
+    FX_MARIONETTE_PORT: String(busy.address().port),
+  });
+  try {
+    const r = await s.rpc({ jsonrpc: '2.0', id: 60, method: 'tools/call', params: { name: 'fx_page', arguments: {} } });
+    assert.equal(r.result.isError, true);
+    const p = JSON.parse(toolText(r));
+    assert.equal(p.need_bootstrap, true);
+    assert.equal(p.probe, 'busy-other-client');
+    assert.match(p.question, /another active client/i);
+    assert.equal(p.options[1].tool, 'fx_connect');
+    assert.ok(p.instruction, 'decision payload carries the relay-to-user instruction');
+
+    // fx_status reports the same state, still not an error
+    const st = JSON.parse(toolText(await s.rpc({ jsonrpc: '2.0', id: 61, method: 'tools/call', params: { name: 'fx_status', arguments: {} } })));
+    assert.equal(st.connected, false);
+    assert.equal(st.probe, 'busy-other-client');
+  } finally {
+    for (const sock of [...busySocks]) { try { sock.destroy(); } catch { /* gone */ } }
+    await new Promise((r) => busy.close(r));
+    await stop(s);
   }
 });

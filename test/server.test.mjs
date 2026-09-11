@@ -107,6 +107,32 @@ test('tools/list exposes the full tool table', async () => {
   assert.match(fc.description, /obscur/);
 });
 
+test('fresh session: a running browser is probed, and tools ask before attaching', async () => {
+  // fx_status is probe-only while no endpoint is committed: it detects the live
+  // fake (running on the configured port from `before`) without opening a session
+  const r0 = await rpc({ jsonrpc: '2.0', id: 300, method: 'tools/call', params: { name: 'fx_status', arguments: {} } });
+  const st = JSON.parse(toolText(r0));
+  assert.equal(st.connected, false, 'probe must not open a session: ' + toolText(r0));
+  assert.equal(st.probe, 'browser-detected');
+  assert.equal(st.detected.port, fake.port);
+  assert.deepEqual(st.bootstrap.options.map((o) => o.tool), ['fx_connect', 'fx_launch', null]);
+
+  // a browser tool must NOT attach on its own — it returns the decision instead
+  const r1 = await rpc({ jsonrpc: '2.0', id: 301, method: 'tools/call', params: { name: 'fx_navigate', arguments: { url: 'https://example.test/' } } });
+  assert.equal(r1.result.isError, true, r1.result.content[0].text);
+  const p = JSON.parse(r1.result.content[0].text);
+  assert.equal(p.need_bootstrap, true);
+  assert.equal(p.probe, 'browser-detected');
+  assert.ok(p.instruction, 'decision payload carries the relay-to-user instruction');
+
+  // user picks option 1 → fx_connect commits the endpoint; same call class runs from then on
+  const r2 = await rpc({ jsonrpc: '2.0', id: 302, method: 'tools/call', params: { name: 'fx_connect', arguments: {} } });
+  const c = JSON.parse(toolText(r2));
+  assert.equal(c.ok, true, toolText(r2));
+  assert.equal(c.session, 'fake-sess-1');
+  assert.equal(c.endpoint.port, fake.port);
+});
+
 test('fx_status reaches the browser through the fake', async () => {
   const r = await rpc({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'fx_status', arguments: {} } });
   const t = toolText(r);
