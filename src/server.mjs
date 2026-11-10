@@ -1265,7 +1265,7 @@ const TOOLS = [
     if (!r || r.ok === false) throw new Error('fx_text: ' + (r && r.error ? r.error : 'element not found'));
     return r;
   }),
-  T('fx_key', 'Press a keyboard key (or chord) — the missing primitive for scrolling long content, dismissing overlays (Escape), submitting forms (Enter), tabbing between fields, etc. `key` is a single key ("Enter", "Escape", "Tab", "ArrowDown", "Home", "End", "PageUp", "PageDown", "a", "1", …) or a chord with modifiers ("Control+a", "Shift+Tab", "Alt+ArrowLeft"). Optionally targets a `ref`/`selector` (keys sent to that element); otherwise to the focused element / page. `times` repeats a simple key (e.g. ArrowDown ×20 to scroll). For scrolling a specific container to a position, prefer fx_scroll; use fx_key PageUp/PageDown/Home/End for document-level scrolling. Keys are encoded as W3C PUA codepoints (\\ue007=Enter, \\ue004=Tab, etc.) which Marionette ElementSendKeys expects.', {
+  T('fx_key', 'Press a keyboard key (or chord) — the missing primitive for scrolling long content, dismissing overlays (Escape), submitting forms (Enter), tabbing between fields, etc. `key` is a single key ("Enter", "Escape", "Tab", "ArrowDown", "Home", "End", "PageUp", "PageDown", "a", "1", …) or a chord with modifiers ("Control+a", "Shift+Tab", "Alt+ArrowLeft"). Targets a `ref`/`selector` when given; otherwise keys go to `document.body` (works for scroll/nav keys like Home/End/PageUp/PageDown/Arrows — Marionette\'s bare no-element SendKeys is not supported, so body is the fallback). `times` repeats a simple key (e.g. ArrowDown ×20 to scroll). For scrolling a specific container to a position, prefer fx_scroll; use fx_key PageUp/PageDown/Home/End for document-level scrolling. Keys are encoded as W3C PUA codepoints (\\ue007=Enter, \\ue004=Tab, etc.) which Marionette ElementSendKeys expects.', {
     key: { type: 'string', description: 'key name or chord, e.g. "Enter", "Escape", "Tab", "ArrowDown", "Home", "Control+a", "Shift+Tab"' },
     ref: { type: 'number', description: 'send keys to this element (from fx_snapshot)' },
     selector: { type: 'string', description: 'send keys to this element (CSS selector)' },
@@ -1320,21 +1320,33 @@ const TOOLS = [
     // Chord = modifier codepoints concatenated with the main key (no NULL
     // terminator needed for ElementSendKeys; Marionette handles keyup).
     const chord = modifiers.join('') + w3c;
-    // Resolve the target element (optional).
+    // Resolve the target element. When no ref/selector is given, target
+    // document.body — Marionette's bare WebDriver:SendKeys (no element) is not
+    // reliably supported, but ElementSendKeys on body works for scroll/nav keys
+    // (Home/End/PageUp/PageDown/Arrows) and is always present.
     let elRef;
+    let targetDesc;
     if (a.ref != null || a.selector) {
       const p = resolveElRef(a);
       if (p.shadow) throw new Error('fx_key: shadow-root element — the driver cannot target it; focus it via fx_click first, then omit ref/selector');
       if (p.using === 'css selector') { p.value = hardenCss(p.value); await checkCss(p.value); }
       elRef = await findEl(p.using, p.value);
+      targetDesc = 'element';
+    } else {
+      // No explicit target: use document.body via a CSS selector find.
+      // Blur any focused input first so scroll/nav keys don't leak into a
+      // text field (Marionette can deliver ElementSendKeys to the focused
+      // element even when the command targets body).
+      try { await execJs(`(function(){ var a = document.activeElement; if (a && a.blur) a.blur(); var b = document.body; if (b && b.focus) b.focus(); })();`); } catch { /* best-effort */ }
+      elRef = await findEl('css selector', 'body');
+      targetDesc = 'body';
     }
     // Send the key `times` times. Each iteration is a separate SendKeys
     // command so each press is a clean keydown+keyup event.
     for (let i = 0; i < times; i++) {
-      if (elRef) await M.cmd('WebDriver:ElementSendKeys', { id: elRef, text: chord });
-      else await M.cmd('WebDriver:SendKeys', { text: chord });
+      await M.cmd('WebDriver:ElementSendKeys', { id: elRef, text: chord });
     }
-    return { ok: true, key: a.key, sent: times, to: elRef ? 'element' : 'focused' };
+    return { ok: true, key: a.key, sent: times, to: targetDesc };
   }),
   T('fx_wait', 'Wait until visible text (or CSS selector exists). Text search looks inside open shadow roots too. Default 10s, max 30s', { text: { type: 'string' }, selector: { type: 'string' }, timeout_ms: { type: 'number' } }, async (a) => {
     const ms = Math.min(30000, a.timeout_ms || 10000);

@@ -149,6 +149,21 @@ try {
   await call('fx_navigate', { url: 'file://' + TEST_HTML });
   await sleep(800);
 
+  // --- fx_key: document-level scroll (run on clean page state, before any
+  // form interaction focuses an input, so keys can't leak into a field) ---
+  await call('fx_key', { key: 'Home' });
+  await sleep(200);
+  await call('fx_key', { key: 'End' });
+  await sleep(300);
+  const scrollAfter = await call('fx_eval', { js: 'return window.scrollY;' });
+  check('fx_key: End scrolls the document to a real position', scrollAfter, (t, e) => {
+    if (e) return false;
+    const yAfter = JSON.parse(t).r;
+    return typeof yAfter === 'number' && yAfter > 100; // page is >2000px tall
+  });
+  await call('fx_key', { key: 'Home' }); // back to top for the form tests
+  await sleep(200);
+
   check('fx_form: labels, options, password mask, file field', await call('fx_form', {}), (t, e) => !e && t.includes('Full Name') && t.includes('Denver') && t.includes('Junior') && t.includes('CV') && t.includes('-pw-'));
   check('fx_field: text by index (real keystrokes)', await call('fx_field', { index: 1, value: 'Test User' }), (t) => t.includes('"confirmed": "Test User"'));
   check('fx_field: text by label', await call('fx_field', { label: 'Work Email', value: 'test@example.com' }), (t, e) => !e && t.includes('"confirmed": "test@example.com"'));
@@ -185,22 +200,8 @@ try {
     return o.ok && o.text === '' && o.len === 0;
   });
   check('neg: fx_text no element matched', await call('fx_text', { selector: '#does-not-exist-xyz' }), (t, e) => e && t.includes('no element matched'));
-  // --- fx_key: keyboard primitive (scroll / focus / chord) ---
-  // The page is tall (2000px block + submit button). Press End to scroll to the
-  // bottom; assert we land at a real, non-zero scroll position (End works).
-  // Comparing before/after is fragile (prior scrolls in the session), so just
-  // confirm End produced a meaningful downward scroll.
-  await call('fx_key', { key: 'Home' }); // ensure we start at the top
-  await sleep(250);
-  await call('fx_key', { key: 'End' });
-  await sleep(300);
-  const after = await call('fx_eval', { js: 'return window.scrollY;' });
-  check('fx_key: End scrolls the document to a real position', after, (t, e) => {
-    if (e) return false;
-    const yAfter = JSON.parse(t).r;
-    return typeof yAfter === 'number' && yAfter > 100; // page is >2000px tall
-  });
-  // Chord to a target element: Control+a on the #name field (select-all).
+  // --- fx_key: chord + negative cases (the document-scroll check runs earlier,
+  // on clean page state, to avoid key-leak into focused form fields) ---
   check('fx_key: chord Control+a accepted (no protocol error)', await call('fx_key', { key: 'Control+a', selector: '#name' }), (t, e) => !e && t.includes('"ok": true'));
   check('neg: fx_key unsupported key', await call('fx_key', { key: 'NotAKey' }), (t, e) => e && t.includes('unsupported key'));
   check('neg: fx_key unsupported modifier', await call('fx_key', { key: 'Super+a' }), (t, e) => e && t.includes('unsupported modifier'));
