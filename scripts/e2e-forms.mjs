@@ -140,7 +140,11 @@ function check(label, r, expect) {
 try {
   const list = await rpc('tools/list', {});
   const names = list.result.tools.map((t) => t.name);
-  check('tools/list: 27 tools incl. 4 form primitives + fx_gates + fx_connect + read tools', { result: { content: [{ text: names.join(',') }] } }, (t) => ['fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_connect', 'fx_links', 'fx_extract', 'fx_search'].every((n) => t.includes(n)) && t.split(',').length === 27);
+  check('tools/list: 31 tools incl. form primitives + fx_gates + fx_connect + read + text/key tools', { result: { content: [{ text: names.join(',') }] } }, (t) => ['fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_connect', 'fx_links', 'fx_extract', 'fx_search', 'fx_text', 'fx_key'].every((n) => t.includes(n)) && t.split(',').length === 31);
+
+  // Commit the endpoint so the first browser call doesn't hit the
+  // browser-detected gate (a fresh server process has no committed endpoint).
+  await call('fx_connect', { host: '127.0.0.1', port });
 
   await call('fx_navigate', { url: 'file://' + TEST_HTML });
   await sleep(800);
@@ -158,6 +162,48 @@ try {
   check('neg: fx_field file input -> fx_upload hint', await call('fx_field', { id: 'cv', value: 'x' }), (t, e) => e && t.includes('fx_upload'));
   check('fx_eval: awaits a Promise-returning body', await call('fx_eval', { js: 'return new Promise(function (r) { setTimeout(function () { r("settled-e2e"); }, 250); });' }), (t, e) => !e && t.includes('"awaited": true') && t.includes('settled-e2e'));
   check('fx_eval: errors when the Promise never settles', await call('fx_eval', { js: 'return new Promise(function () {});', wait_ms: 400 }), (t, e) => e && t.includes('did not settle within 400 ms'));
+  // --- fx_text: read element text (the long-content primitive) ---
+  // NOTE: <input> elements have no innerText (their content is .value), so
+  // fx_text on an input correctly returns "". Use a non-input element for the
+  // positive text check.
+  check('fx_text: innerText of a known element by selector (h1)', await call('fx_text', { selector: 'h1' }), (t, e) => !e && t.includes('Test Form'));
+  check('fx_text: whole-page text via body selector', await call('fx_text', { selector: 'body' }), (t, e) => !e && t.includes('Test Form') && t.includes('Submit Test'));
+  check('fx_text: raw:true returns textContent (hidden-inclusive)', await call('fx_text', { selector: '#q-city', raw: true }), (t, e) => !e && t.includes('Denver') && t.includes('Austin'));
+  check('fx_text: all:true returns one entry per match', await call('fx_text', { selector: 'label input[type="radio"]', all: true }), (t, e) => {
+    if (e) return false;
+    const o = JSON.parse(t);
+    return o.ok && o.count >= 3 && Array.isArray(o.texts) && o.texts.length === Math.min(o.count, 25);
+  });
+  check('fx_text: textLen caps each entry', await call('fx_text', { selector: 'body', textLen: 20 }), (t, e) => {
+    if (e) return false;
+    const o = JSON.parse(t);
+    return o.ok && o.text.length <= 20;
+  });
+  check('fx_text: input element has no innerText (correctly empty)', await call('fx_text', { selector: '#name' }), (t, e) => {
+    if (e) return false;
+    const o = JSON.parse(t);
+    return o.ok && o.text === '' && o.len === 0;
+  });
+  check('neg: fx_text no element matched', await call('fx_text', { selector: '#does-not-exist-xyz' }), (t, e) => e && t.includes('no element matched'));
+  // --- fx_key: keyboard primitive (scroll / focus / chord) ---
+  // The page is tall (2000px block + submit button). Press End to scroll to the
+  // bottom; assert we land at a real, non-zero scroll position (End works).
+  // Comparing before/after is fragile (prior scrolls in the session), so just
+  // confirm End produced a meaningful downward scroll.
+  await call('fx_key', { key: 'Home' }); // ensure we start at the top
+  await sleep(250);
+  await call('fx_key', { key: 'End' });
+  await sleep(300);
+  const after = await call('fx_eval', { js: 'return window.scrollY;' });
+  check('fx_key: End scrolls the document to a real position', after, (t, e) => {
+    if (e) return false;
+    const yAfter = JSON.parse(t).r;
+    return typeof yAfter === 'number' && yAfter > 100; // page is >2000px tall
+  });
+  // Chord to a target element: Control+a on the #name field (select-all).
+  check('fx_key: chord Control+a accepted (no protocol error)', await call('fx_key', { key: 'Control+a', selector: '#name' }), (t, e) => !e && t.includes('"ok": true'));
+  check('neg: fx_key unsupported key', await call('fx_key', { key: 'NotAKey' }), (t, e) => e && t.includes('unsupported key'));
+  check('neg: fx_key unsupported modifier', await call('fx_key', { key: 'Super+a' }), (t, e) => e && t.includes('unsupported modifier'));
   check('fx_type: digit-leading #id auto-rewritten to [id="…"]', await call('fx_type', { selector: '#0123abc-def', text: 'digit-ok' }), (t, e) => !e && /"used": "\[id=\\"0123abc-def\\"\]/.test(t));
   check('fx_form: aggregated choice groups (context per group)', await call('fx_form', {}), (t, e) => {
     if (e) return false;

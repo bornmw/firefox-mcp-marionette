@@ -118,7 +118,7 @@ Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop che
  AI agent (e.g. opencode)
         │  stdio · newline-delimited JSON-RPC 2.0
         ▼
-  firefox-mcp-marionette (src/server.mjs)          ── tools: fx_* (29)
+  firefox-mcp-marionette (src/server.mjs)          ── tools: fx_* (31)
         │  loopback TCP · <byteLen>:<json> frames
         ▼
  your Firefox (firefox --marionette)      ── your profile, your cookies
@@ -167,7 +167,9 @@ Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop che
 | `fx_links` | All hyperlinks of the current page: text + absolute href (optional `selector` filter; reads open shadow roots). Generic read — no JS needed |
 | `fx_extract` | Structured page read ("scrape" without JS): one row per container `selector`; per-row `fields {name: css\|"text"}` |
 | `fx_search` | Search without JS: navigate to engine results (google/bing/duckduckgo presets; overridable `container`/`title`/`snippet`), return `{title, link, snippet}` rows; `resolve:true` follows each link in the browser and reports the real final URL/title (needed for redirect-wrapped hrefs, e.g. Google `/goto`) |
-| `fx_eval` | Run JS in the page (function body; `return` your value — a returned Promise is awaited, default 30 s via `wait_ms`) |
+| `fx_eval` | Run JS in the page (function body; `return` your value — a returned Promise is awaited, default 30 s via `wait_ms`). Result is always a `{r, …}` object: `r` is the value, and a `note` field disambiguates completion-with-`undefined` (the expression ran but produced no value — your selector likely matched nothing) from a real `null`. Never returns a bare `null` |
+| `fx_text` | Return the text of an element — the simplest way to read long content (an AI response, an article, a table cell) without `fx_eval` JS. By `ref` (from `fx_snapshot`) or CSS `selector` (default `body` → whole page). Returns `innerText` (visible, layout-aware) by default; `raw:true` for `textContent` (incl. hidden, no line breaks). Crosses OPEN shadow roots (a `SHADOW` ref resolves in-page). `all:true` returns one entry per match (capped at `max`); `textLen` caps chars per entry (default 20000) |
+| `fx_key` | Press a keyboard key or chord — the primitive for scrolling long content, dismissing overlays (`Escape`), submitting forms (`Enter`), tabbing between fields. `key` is a single key (`"Enter"`, `"Escape"`, `"Tab"`, `"ArrowDown"`, `"Home"`, `"End"`, `"PageUp"`, `"PageDown"`, `"a"`, `"1"`, …) or a chord (`"Control+a"`, `"Shift+Tab"`, `"Alt+ArrowLeft"`). Optional `ref`/`selector` targets an element; otherwise the focused element/page. `times` repeats a simple key (e.g. `ArrowDown` ×20). Keys encode as W3C PUA codepoints (`\ue007`=Enter, `\ue004`=Tab, …). For container-position scrolling prefer `fx_scroll`; use `fx_key` `Home`/`End`/`PageUp`/`PageDown` for document-level scrolling |
 | `fx_wait` | Wait for visible text or CSS selector (≤ 30 s) |
 | `fx_screenshot` | Full-page PNG (not just the viewport) to a file under an allowed root |
 | `fx_windows` / `fx_window` | List / switch windows |

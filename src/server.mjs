@@ -1174,24 +1174,167 @@ const TOOLS = [
     }
     return { engine: a.engine || 'google', query: q, url: serp, ready, count: rows.length, results: rows };
   }),
-  T('fx_eval', 'Execute JS in the page. `js` is tried as an EXPRESSION first — its completion value is returned, so `1 + 1`, `document.title`, `var x = 1; x`, `(async () => { … })()` and `fetch(u).then(r => r.json())` all work without `return`. If that fails with a SyntaxError (classic function-body style with a top-level `return`), it is re-run as a function body — so `return value` scripts work too. A rejected or Promise value is awaited (default max 30s, wait_ms to tune) and returned as {r: value, awaited: true}; a rejected or long-unsettled Promise is an error.', { js: { type: 'string' }, wait_ms: { type: 'number', description: 'max wait for a Promise-returning body (default 30000, max 120000)' } }, async (a) => {
+  T('fx_eval', 'Execute JS in the page. `js` is tried as an EXPRESSION first — its completion value is returned, so `1 + 1`, `document.title`, `var x = 1; x`, `(async () => { … })()` and `fetch(u).then(r => r.json())` all work without `return`. If that fails with a SyntaxError (classic function-body style with a top-level `return`), it is re-run as a function body — so `return value` scripts work too. A rejected or Promise value is awaited (default max 30s, wait_ms to tune) and returned as {r: value, awaited: true}; a rejected or long-unsettled Promise is an error. The result is ALWAYS a {r, …} object: r is the value, and a `note` field disambiguates completion-with-undefined (note:"undefined" — the expression ran but produced no value; your selector likely matched nothing) from a real null (r===null with no note). Never returns a bare null.', { js: { type: 'string' }, wait_ms: { type: 'number', description: 'max wait for a Promise-returning body (default 30000, max 120000)' } }, async (a) => {
     const w = await execJs(EVAL_WRAP, [String(a.js)]);
     if (!w || typeof w !== 'object' || typeof w.__fx !== 'string') {
       throw new Error('fx_eval: unexpected driver response (no eval wrapper tag)');
     }
     if (w.__fx === 'err') throw new Error('fx_eval page error: ' + (w.m || 'unknown'));
-    if (w.__fx === 'ok') return { r: w.v };
+    if (w.__fx === 'ok') {
+      // Distinguish "completed with undefined" (selector matched nothing, bare
+      // statement, etc.) from a real null value. Without this the caller sees a
+      // bare null and cannot tell "page has no such element" from "harness
+      // dropped my result".
+      return w.v === undefined ? { r: null, note: 'undefined — expression completed with no value (selector may have matched nothing)' } : { r: w.v };
+    }
     const ms = Math.min(120000, Math.max(0, Number(a.wait_ms) || 30000));
     const t0 = Date.now();
     for (;;) {
       const p = await execJs(EVAL_POLL, []);
       if (p && typeof p === 'object' && typeof p.__fx === 'string') {
         if (p.__fx === 'err') throw new Error('fx_eval: Promise rejected: ' + (p.m || 'unknown'));
-        return { r: p.v, awaited: true };
+        return p.v === undefined
+          ? { r: null, awaited: true, note: 'undefined — Promise resolved with no value' }
+          : { r: p.v, awaited: true };
       }
       if (Date.now() - t0 > ms) throw new Error('fx_eval: Promise did not settle within ' + ms + ' ms');
       await new Promise((r) => setTimeout(r, 150));
     }
+  }),
+  T('fx_text', 'Return the text of an element — the simplest way to read long content (an AI response, an article, a table cell) without fx_eval JS. By ref (from fx_snapshot) or CSS selector. Returns innerText (visible, layout-aware) by default; use raw:true for textContent (includes hidden nodes, no line breaks). Crosses OPEN shadow roots: a shadow ref (marked SHADOW in fx_snapshot) is resolved in-page. If the selector matches several elements and all:true is set, returns one entry per match (capped at max). For the whole page, use selector "body".', {
+    ref: { type: 'number' },
+    selector: { type: 'string', description: 'CSS selector (default: body → whole page)' },
+    raw: { type: 'boolean', description: 'true = textContent (incl. hidden, no line breaks); default false = innerText' },
+    all: { type: 'boolean', description: 'true = return text of EVERY match, not just the first' },
+    max: { type: 'number', description: 'max entries when all:true (default 25, cap 200)' },
+    textLen: { type: 'number', description: 'max chars per entry (default 20000; 0 = no cap)' },
+  }, async (a) => {
+    const cap = a.textLen === 0 ? 0 : Math.min(200000, Math.max(0, Number(a.textLen) || 20000));
+    const maxN = Math.min(200, Math.max(1, Number(a.max) || 25));
+    const useRaw = a.raw === true;
+    const wantAll = a.all === true;
+    // Resolve target in-page so shadow refs (sh: marker) work too. Light-DOM
+    // selectors and sh: markers both go through __deepResolve/querySelector here.
+    const marker = (a.ref != null || a.selector) ? refMarker(a) : 'body';
+    const r = await execJs(DEEP_UTIL + `
+      const s = arguments[0];
+      const useRaw = arguments[1];
+      const wantAll = arguments[2];
+      const cap = arguments[3];
+      const maxN = arguments[4];
+      function resolveOne(sel){
+        if (sel.indexOf('sh:') === 0) return __deepResolve(sel);
+        if (sel.indexOf('xpath:') === 0) return document.evaluate(sel.slice(6), document, null, 9, null).singleNodeValue;
+        return document.querySelector(sel);
+      }
+      function resolveMany(sel){
+        if (sel.indexOf('sh:') === 0) { var e = __deepResolve(sel); return e ? [e] : []; }
+        if (sel.indexOf('xpath:') === 0) return [document.evaluate(sel.slice(6), document, null, 9, null).singleNodeValue].filter(Boolean);
+        var out = [];
+        try { document.querySelectorAll(sel).forEach(function(e){ out.push(e); }); } catch (e) {}
+        // also include matches inside open shadow roots
+        (function collect(root, depth){
+          if (!root || depth > 12) return;
+          var els; try { els = root.querySelectorAll('*'); } catch (e) { return; }
+          for (var i = 0; i < els.length; i++) {
+            var sr = els[i].shadowRoot;
+            if (!sr) continue;
+            var m; try { m = sr.querySelectorAll(sel); } catch (e) { continue; }
+            m.forEach(function(e){ out.push(e); });
+            collect(sr, depth + 1);
+          }
+        })(document, 0);
+        return out;
+      }
+      function textOf(el){
+        var t = useRaw ? (el.textContent || '') : (el.innerText || el.textContent || '');
+        if (cap > 0) t = t.slice(0, cap);
+        return t;
+      }
+      if (!wantAll) {
+        var el1 = resolveOne(s);
+        if (!el1) return { ok: false, error: 'no element matched: ' + s };
+        return { ok: true, text: textOf(el1), len: (useRaw ? (el1.textContent||'') : (el1.innerText||el1.textContent||'')).length };
+      }
+      var els = resolveMany(s);
+      if (!els.length) return { ok: false, error: 'no elements matched: ' + s };
+      var rows = [];
+      for (var i = 0; i < els.length && i < maxN; i++) rows.push(textOf(els[i]));
+      return { ok: true, count: els.length, returned: rows.length, texts: rows };
+    `, [marker, useRaw, wantAll, cap, maxN]);
+    if (!r || r.ok === false) throw new Error('fx_text: ' + (r && r.error ? r.error : 'element not found'));
+    return r;
+  }),
+  T('fx_key', 'Press a keyboard key (or chord) — the missing primitive for scrolling long content, dismissing overlays (Escape), submitting forms (Enter), tabbing between fields, etc. `key` is a single key ("Enter", "Escape", "Tab", "ArrowDown", "Home", "End", "PageUp", "PageDown", "a", "1", …) or a chord with modifiers ("Control+a", "Shift+Tab", "Alt+ArrowLeft"). Optionally targets a `ref`/`selector` (keys sent to that element); otherwise to the focused element / page. `times` repeats a simple key (e.g. ArrowDown ×20 to scroll). For scrolling a specific container to a position, prefer fx_scroll; use fx_key PageUp/PageDown/Home/End for document-level scrolling. Keys are encoded as W3C PUA codepoints (\\ue007=Enter, \\ue004=Tab, etc.) which Marionette ElementSendKeys expects.', {
+    key: { type: 'string', description: 'key name or chord, e.g. "Enter", "Escape", "Tab", "ArrowDown", "Home", "Control+a", "Shift+Tab"' },
+    ref: { type: 'number', description: 'send keys to this element (from fx_snapshot)' },
+    selector: { type: 'string', description: 'send keys to this element (CSS selector)' },
+    times: { type: 'number', description: 'repeat a simple (unmodified) key this many times (default 1, cap 200)' },
+  }, async (a) => {
+    if (!a.key || typeof a.key !== 'string') throw new Error('fx_key: `key` is required');
+    const times = Math.min(200, Math.max(1, Number(a.times) || 1));
+    // W3C WebDriver key values use Unicode PUA codepoints (U+E000–U+E040).
+    // Marionette ElementSendKeys expects these, not named strings.
+    const W3C_KEY = {
+      'NULL': '\\ue000', 'CANCEL': '\\ue001', 'HELP': '\\ue002',
+      'BACK_SPACE': '\\ue003', 'BACKSPACE': '\\ue003',
+      'TAB': '\\ue004', 'CLEAR': '\\ue005',
+      'RETURN': '\\ue006', 'ENTER': '\\ue007',
+      'SHIFT': '\\ue008', 'CONTROL': '\\ue009', 'CTRL': '\\ue009', 'ALT': '\\ue00a',
+      'PAUSE': '\\ue00b', 'ESCAPE': '\\ue00c', 'ESC': '\\ue00c',
+      'SPACE': '\\ue00d',
+      'PAGE_UP': '\\ue00e', 'PAGEUP': '\\ue00e',
+      'PAGE_DOWN': '\\ue00f', 'PAGEDOWN': '\\ue00f',
+      'END': '\\ue010', 'HOME': '\\ue011',
+      'ARROW_LEFT': '\\ue012', 'LEFT': '\\ue012',
+      'ARROW_UP': '\\ue013', 'UP': '\\ue013',
+      'ARROW_RIGHT': '\\ue014', 'RIGHT': '\\ue014',
+      'ARROW_DOWN': '\\ue015', 'DOWN': '\\ue015',
+      'INSERT': '\\ue016', 'DELETE': '\\ue017', 'DEL': '\\ue017',
+      // F1–F12: U+E031–U+E03C; F13–F24 continue the sequence
+      'F1': '\\ue031', 'F2': '\\ue032', 'F3': '\\ue033', 'F4': '\\ue034', 'F5': '\\ue035',
+      'F6': '\\ue036', 'F7': '\\ue037', 'F8': '\\ue038', 'F9': '\\ue039',
+      'F10': '\\ue03a', 'F11': '\\ue03b', 'F12': '\\ue03c',
+      'META': '\\ue03d', 'COMMAND': '\\ue03d', 'OS': '\\ue03d',
+    };
+    const parts = String(a.key).split('+');
+    const modifiers = [];
+    const main = parts[parts.length - 1].trim();
+    for (let i = 0; i < parts.length - 1; i++) {
+      const m = parts[i].trim().toUpperCase();
+      const modCode = W3C_KEY[m];
+      if (!modCode) throw new Error('fx_key: unsupported modifier "' + parts[i] + '" (use Shift/Control/Alt/Meta)');
+      modifiers.push(modCode);
+    }
+    // Resolve the main key to a W3C value.
+    let w3c;
+    const upper = main.toUpperCase();
+    if (W3C_KEY[upper] !== undefined) w3c = W3C_KEY[upper];
+    else if (/^[a-zA-Z0-9]$/.test(main)) w3c = main; // single letter or digit, as-is
+    else if (/^F\d{1,2}$/.test(upper)) {
+      const n = parseInt(upper.slice(1), 10);
+      if (n >= 1 && n <= 24) w3c = String.fromCharCode(0xe031 + (n - 1)); // F1=U+E031 … F24
+      else throw new Error('fx_key: unsupported function key "' + main + '" (F1–F24)');
+    }
+    else throw new Error('fx_key: unsupported key "' + main + '" (use a named key, single letter/digit, or F1–F24)');
+    // Chord = modifier codepoints concatenated with the main key (no NULL
+    // terminator needed for ElementSendKeys; Marionette handles keyup).
+    const chord = modifiers.join('') + w3c;
+    // Resolve the target element (optional).
+    let elRef;
+    if (a.ref != null || a.selector) {
+      const p = resolveElRef(a);
+      if (p.shadow) throw new Error('fx_key: shadow-root element — the driver cannot target it; focus it via fx_click first, then omit ref/selector');
+      if (p.using === 'css selector') { p.value = hardenCss(p.value); await checkCss(p.value); }
+      elRef = await findEl(p.using, p.value);
+    }
+    // Send the key `times` times. Each iteration is a separate SendKeys
+    // command so each press is a clean keydown+keyup event.
+    for (let i = 0; i < times; i++) {
+      if (elRef) await M.cmd('WebDriver:ElementSendKeys', { id: elRef, text: chord });
+      else await M.cmd('WebDriver:SendKeys', { text: chord });
+    }
+    return { ok: true, key: a.key, sent: times, to: elRef ? 'element' : 'focused' };
   }),
   T('fx_wait', 'Wait until visible text (or CSS selector exists). Text search looks inside open shadow roots too. Default 10s, max 30s', { text: { type: 'string' }, selector: { type: 'string' }, timeout_ms: { type: 'number' } }, async (a) => {
     const ms = Math.min(30000, a.timeout_ms || 10000);
@@ -1255,13 +1398,15 @@ async function ensureConn() {
 
 function toolResult(payload, opts) {
   const isError = !!(opts && opts.isError);
-  if (payload && typeof payload === 'object' && !Array.isArray(payload) && typeof payload.text !== 'string') {
-    return { content: [{ type: 'text', text: JSON.stringify(payload, null, 1) }], isError };
-  }
   // A pure {text: <string>} wrapper (e.g. fx_alert_state) carries its content in
-  // `text` — String(payload) would render "[object Object]" and lose it.
+  // `text` — String(payload) would render "[object Object]" and lose it. Match
+  // ONLY the single-key case; any object with additional fields (e.g. fx_text's
+  // {ok, text, len}) must be JSON-stringified, not raw-texted.
   if (payload && typeof payload === 'object' && !Array.isArray(payload) && typeof payload.text === 'string' && Object.keys(payload).length === 1) {
     return { content: [{ type: 'text', text: payload.text }], isError };
+  }
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    return { content: [{ type: 'text', text: JSON.stringify(payload, null, 1) }], isError };
   }
   return { content: [{ type: 'text', text: String(payload ?? '') }], isError };
 }

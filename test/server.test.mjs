@@ -81,8 +81,8 @@ test('initialize returns server identity and echoes protocol version', async () 
 test('tools/list exposes the full tool table', async () => {
   const r = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
   const names = r.result.tools.map((t) => t.name);
-  assert.equal(names.length, 29, names.join(','));
-  for (const n of ['fx_status', 'fx_launch', 'fx_shutdown', 'fx_connect', 'fx_navigate', 'fx_snapshot', 'fx_click', 'fx_type', 'fx_select', 'fx_toggle', 'fx_upload', 'fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_links', 'fx_extract', 'fx_search', 'fx_eval', 'fx_wait', 'fx_screenshot', 'fx_cookies']) {
+  assert.equal(names.length, 31, names.join(','));
+  for (const n of ['fx_status', 'fx_launch', 'fx_shutdown', 'fx_connect', 'fx_navigate', 'fx_snapshot', 'fx_click', 'fx_type', 'fx_select', 'fx_toggle', 'fx_upload', 'fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_links', 'fx_extract', 'fx_search', 'fx_eval', 'fx_text', 'fx_key', 'fx_wait', 'fx_screenshot', 'fx_cookies']) {
     assert.ok(names.includes(n), 'missing tool ' + n);
   }
   for (const t of r.result.tools) {
@@ -105,6 +105,12 @@ test('tools/list exposes the full tool table', async () => {
   assert.match(fg.description, /attestation/i);
   const fc = r.result.tools.find((t) => t.name === 'fx_click');
   assert.match(fc.description, /obscur/);
+  const ft = r.result.tools.find((t) => t.name === 'fx_text');
+  assert.match(ft.description, /innerText/i, 'fx_text documents innerText default');
+  assert.match(ft.description, /shadow/i, 'fx_text documents shadow-root support');
+  const fk = r.result.tools.find((t) => t.name === 'fx_key');
+  assert.match(fk.description, /chord/i, 'fx_key documents chords');
+  assert.match(fk.description, /PUA/i, 'fx_key documents W3C PUA encoding');
 });
 
 test('fresh session: a running browser is probed, and tools ask before attaching', async () => {
