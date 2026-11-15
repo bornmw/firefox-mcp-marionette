@@ -48,7 +48,7 @@ opencode (`opencode.json`):
 }
 ```
 
-Pin a version with `"command": ["npx", "-y", "firefox-mcp-marionette@0.8.0"]`; developing from a local checkout instead? Use `"command": ["node", "/absolute/path/to/firefox-mcp-marionette/src/server.mjs"]` — the same `environment` block works for both.
+Pin a version with `"command": ["npx", "-y", "firefox-mcp-marionette@0.10.0"]`; developing from a local checkout instead? Use `"command": ["node", "/absolute/path/to/firefox-mcp-marionette/src/server.mjs"]` — the same `environment` block works for both.
 
 **2. Have a Firefox listening on port 2828 — or don't.** Either launch one yourself:
 
@@ -131,6 +131,7 @@ Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop che
 ### Design notes (bugs that cost real debugging time)
 
 * **Frames are pure ASCII.** `JSON.stringify` does not escape `U+E000`/`U+E001` (W3C file markers) or any char ≥ `0x7F`; in UTF-8 those are multi-byte, while the length prefix is computed from string length. That desynchronizes the stream for the rest of the connection. Every frame is `\uXXXX`-escaped so declared length always equals actual bytes (regression-tested).
+* **W3C key codepoints are real characters, not escape text.** `ElementSendKeys` expects the PUA codepoint `U+E007` as a *single character*; the 6-char literal text `\ue007` (what a double-escaped JS string literal like `'\\ue007'` produces) types a backslash plus letters into the page instead of pressing Enter. `fx_key`'s named-key map was shipped double-escaped, so every named key (Enter/Tab/Escape/Home/End/arrows/modifiers) was a silent no-op while letters/digits — which pass through as-is — masked it; proven by wire-frame capture through a MITM proxy, pinned by a unit test.
 * **Element refs are unwrapped.** `FindElement` replies wrap the uuid (`{ "element-…": "uuid" }`); subsequent commands (`ElementClick`, `ElementSendKeys`, …) take the *bare* uuid.
 * **File uploads use the raw absolute path** in `ElementSendKeys` — this protocol generation has no W3C base64 file encoding (those codepoints are the legacy Selenium `NULL`/`CANCEL` keys there).
 * **Script bodies must `return`.** W3C `ExecuteScript` bodies are function *bodies*: a bare expression statement evaluates and is discarded.
@@ -150,7 +151,7 @@ Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop che
 | `fx_status` | Connection, active **`endpoint`** vs `configured`, session, current page, `navigator.webdriver`. Never opens a session on its own: with no committed endpoint it probes non-invasively (connect → expect `hello` → close) and returns `connected:false` + probe result + options; with a committed endpoint it attaches/re-attaches and reports live state. Reports `launched`/`launchedCurrent` when this server started the instance |
 | `fx_launch` | Bootstrap option 1: start a NEW dedicated Firefox — fresh profile (`<root>/firefox-mcp-marionette-<port>`), port written into `user.js` **prefs** (`marionette.port`; no CLI flag exists), `firefox --marionette --no-remote -profile <dir>`, wait for the listener, attach. Optional `{port}` (default: first free above the configured one) and `{profile}` dir. Reuse: re-calling with the same live port re-attaches, no second process |
 | `fx_shutdown` | Stop an instance this server started via `fx_launch` (killed by the recorded pid; a user-launched browser is never touched). Defaults to the current endpoint |
-| `fx_connect` | Bootstrap option 2 / detected-browser approval: (re-)point the MCP at an already-running loopback endpoint `{host, port}` and attach (env-configured default when omitted). This commits the endpoint for the session — later reconnects are silent. Returns the active endpoint, the configured one, and the session; a failed attach returns a structured decision payload (probe result + options) instead of a raw error |
+| `fx_connect` | Bootstrap option 2 / detected-browser approval: (re-)point the MCP at an already-running loopback endpoint `{host, port}` and attach (env-configured default when omitted). This commits the endpoint for the session — later reconnects are silent. Optional `{width, height}` (px, ≥ 200; the missing one defaults to the 1280/900 pair) resizes the window right after attaching. On every attach, a degenerate window (height < 300 px — some compositors open fresh profiles tiny, e.g. 552×172) is auto-normalized to 1280×900. Returns the active endpoint, the configured one, and the session; a failed attach returns a structured decision payload (probe result + options) instead of a raw error |
 | `fx_navigate` | Go to a URL |
 | `fx_page` | Current URL + title |
 | `fx_snapshot` | Interactive-element map with refs (incl. visible `label` text when present) |
@@ -169,7 +170,7 @@ Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop che
 | `fx_search` | Search without JS: navigate to engine results (google/bing/duckduckgo presets; overridable `container`/`title`/`snippet`), return `{title, link, snippet}` rows; `resolve:true` follows each link in the browser and reports the real final URL/title (needed for redirect-wrapped hrefs, e.g. Google `/goto`) |
 | `fx_eval` | Run JS in the page (function body; `return` your value — a returned Promise is awaited, default 30 s via `wait_ms`). Result is always a `{r, …}` object: `r` is the value, and a `note` field disambiguates completion-with-`undefined` (the expression ran but produced no value — your selector likely matched nothing) from a real `null`. Never returns a bare `null` |
 | `fx_text` | Return the text of an element — the simplest way to read long content (an AI response, an article, a table cell) without `fx_eval` JS. By `ref` (from `fx_snapshot`) or CSS `selector` (default `body` → whole page). Returns `innerText` (visible, layout-aware) by default; `raw:true` for `textContent` (incl. hidden, no line breaks). Crosses OPEN shadow roots (a `SHADOW` ref resolves in-page). `all:true` returns one entry per match (capped at `max`); `textLen` caps chars per entry (default 20000) |
-| `fx_key` | Press a keyboard key or chord — the primitive for scrolling long content, dismissing overlays (`Escape`), submitting forms (`Enter`), tabbing between fields. `key` is a single key (`"Enter"`, `"Escape"`, `"Tab"`, `"ArrowDown"`, `"Home"`, `"End"`, `"PageUp"`, `"PageDown"`, `"a"`, `"1"`, …) or a chord (`"Control+a"`, `"Shift+Tab"`, `"Alt+ArrowLeft"`). Optional `ref`/`selector` targets an element; otherwise the focused element/page. `times` repeats a simple key (e.g. `ArrowDown` ×20). Keys encode as W3C PUA codepoints (`\ue007`=Enter, `\ue004`=Tab, …). For container-position scrolling prefer `fx_scroll`; use `fx_key` `Home`/`End`/`PageUp`/`PageDown` for document-level scrolling |
+| `fx_key` | Press a keyboard key or chord — the primitive for scrolling long content, dismissing overlays (`Escape`), submitting forms (`Enter`), tabbing between fields. `key` is a single key (`"Enter"`, `"Escape"`, `"Tab"`, `"ArrowDown"`, `"Home"`, `"End"`, `"PageUp"`, `"PageDown"`, `"a"`, `"1"`, …) or a chord (`"Control+a"`, `"Shift+Tab"`, `"Alt+ArrowLeft"`). Optional `ref`/`selector` targets an element; otherwise keys go to `document.body` (any focused input is blurred first, so scroll/nav keys don't leak into a field). `times` repeats a simple key (e.g. `ArrowDown` ×20). Keys encode as W3C PUA codepoints (`\ue007`=Enter, `\ue004`=Tab, …). For container-position scrolling prefer `fx_scroll`; use `fx_key` `Home`/`End`/`PageUp`/`PageDown` for document-level scrolling |
 | `fx_wait` | Wait for visible text or CSS selector (≤ 30 s) |
 | `fx_screenshot` | Full-page PNG (not just the viewport) to a file under an allowed root |
 | `fx_windows` / `fx_window` | List / switch windows |
@@ -212,9 +213,13 @@ npm test            # or: node --test test/*.test.mjs
 Live-browser tests (start your own `firefox --marionette` first; note Marionette serves one active client at a time — no other firefox-mcp-marionette client may be attached):
 
 * `npm run e2e:live` — connection, navigation, screenshot through the real wire protocol.
-* `npm run e2e:forms` — the form primitives against a self-generated test page (labels, option/state round-trips, click fallbacks, negative cases).
+* `npm run e2e:forms` — the form primitives against a self-generated test page (labels, option/state round-trips, click fallbacks, keyboard scrolling, negative cases).
+* `npm run e2e:gates` — consent/attestation gate audit and obscured-input click recovery against a self-generated test page.
+* `npm run e2e:shadow` — open-shadow-root controls: snapshot refs, click/type/answer across (nested) shadow boundaries.
 
-CI: `.github/workflows/ci.yml` — syntax check + full test suite across Node 20/22/24.
+All four take an optional `[port]` argument (defaults 2828 / 2829).
+
+CI: `.github/workflows/ci.yml` — syntax check + full test suite across Node 20/22/24, plus all four e2e suites against a headless `--marionette` Firefox (latest official build, one browser on 2828).
 
 ## License
 
