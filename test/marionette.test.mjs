@@ -119,3 +119,79 @@ test('send() without a socket rejects cleanly', async () => {
   const m = new Marionette({ port: 1, log: () => {} });
   await assert.rejects(m.send('WebDriver:GetTitle'), /not connected/);
 });
+
+test('send(): privileged-scope failure navigates to about:blank and retries once', async () => {
+  await withClient(async (m, fake) => {
+    await m.connect();
+    await m.init();
+    fake.state.privilegedOnce = new Set(['WebDriver:GetTitle']);
+    const title = await m.send('WebDriver:GetTitle');
+    assert.equal(title.value, 'Fake Page', 'retried command must succeed');
+    const navs = fake.state.frames.filter((f) => f[2] === 'WebDriver:Navigate');
+    assert.equal(navs.length, 1, 'exactly one recovery navigation');
+    assert.deepEqual(navs[0][3], { url: 'about:blank' });
+    const titles = fake.state.frames.filter((f) => f[2] === 'WebDriver:GetTitle');
+    assert.equal(titles.length, 2, 'original attempt + one retry');
+  });
+});
+
+test('send(): persistent privileged-scope failure is not retried forever', async () => {
+  await withClient(async (m, fake) => {
+    await m.connect();
+    await m.init();
+    fake.state.privilegedAlways = true;
+    await assert.rejects(m.send('WebDriver:GetTitle'), /privileged scope/);
+    const navs = fake.state.frames.filter((f) => f[2] === 'WebDriver:Navigate');
+    assert.equal(navs.length, 1, 'single recovery navigation, then the error propagates');
+    const titles = fake.state.frames.filter((f) => f[2] === 'WebDriver:GetTitle');
+    assert.equal(titles.length, 2, 'no retry loop');
+  });
+});
+
+test('send(): NewSession privileged-scope error is not recovered (no session to navigate)', async () => {
+  await withClient(async (m, fake) => {
+    await m.connect();
+    fake.state.newSessionScopeErrorOnce = true;
+    await assert.rejects(m.send('WebDriver:NewSession', {}), /privileged scope/);
+    assert.equal(fake.state.frames.filter((f) => f[2] === 'WebDriver:Navigate').length, 0, 'no navigation before a session exists');
+  });
+});
+
+test('send(): non-privileged errors are rethrown unchanged (no recovery)', async () => {
+  await withClient(async (m, fake) => {
+    await m.connect();
+    await m.init();
+    await assert.rejects(m.send('WebDriver:BoomError'), /something failed/);
+    assert.equal(fake.state.frames.filter((f) => f[2] === 'WebDriver:Navigate').length, 0, 'unrelated errors must not trigger navigation');
+  });
+});
+
+test('init(): non-web initial tab is redirected to about:blank (default initialPage)', async () => {
+  await withClient(async (m, fake) => {
+    fake.state.currentUrl = 'about:home';
+    await m.connect();
+    await m.init();
+    const nav = fake.state.frames.find((f) => f[2] === 'WebDriver:Navigate');
+    assert.ok(nav, 'normalization navigation issued');
+    assert.deepEqual(nav[3], { url: 'about:blank' });
+  });
+});
+
+test('init(): web initial tab is left untouched', async () => {
+  await withClient(async (m, fake) => {
+    fake.state.currentUrl = 'https://fake.test/';
+    await m.connect();
+    await m.init();
+    assert.equal(fake.state.frames.find((f) => f[2] === 'WebDriver:Navigate'), undefined, 'no navigation for a web initial tab');
+  });
+});
+
+test('init(): initialPage=newtab never redirects', async () => {
+  await withClient(async (m, fake) => {
+    m.initialPage = 'newtab';
+    fake.state.currentUrl = 'about:home';
+    await m.connect();
+    await m.init();
+    assert.equal(fake.state.frames.find((f) => f[2] === 'WebDriver:Navigate'), undefined, 'opt-out leaves the initial tab untouched');
+  });
+});

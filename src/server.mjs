@@ -37,6 +37,16 @@ function defaultProfileRoot() { try { return path.join(os.homedir(), '.mozilla',
 const PROFILE_ROOT = process.env.FX_MCP_PROFILE_DIR || defaultProfileRoot();
 const AUTO_LAUNCH = /^(1|true|yes)$/i.test(process.env.FX_MCP_AUTO_LAUNCH || '');
 const FIREFOX_BIN = process.env.FX_MCP_FIREFOX_BIN || ''; // "cmd [args]" — e.g. a test stand-in
+// Initial tab after a session is opened: 'blank' (default) redirects a fresh/
+// internal initial tab (chrome://…/blanktab.html etc.) to about:blank so
+// content commands work immediately; 'newtab' leaves it untouched. Overridable
+// per call via fx_launch / fx_connect {initialPage}.
+function validInitialPage(v, dflt) {
+  const s = String(v == null ? '' : v).toLowerCase();
+  if (!s) return dflt;
+  if (s !== 'blank' && s !== 'newtab') throw new Error("initialPage must be 'blank' or 'newtab' (got '" + v + "')");
+  return s;
+}
 
 const log = (...a) => process.stderr.write(new Date().toISOString() + ' ' + a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ') + '\n');
 
@@ -45,7 +55,7 @@ try {
   VERSION = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version || VERSION;
 } catch { /* dev checkouts without package.json */ }
 
-const M = new Marionette({ host: HOST, port: PORT, commandTimeoutMs: Number(process.env.FX_MCP_CMD_TIMEOUT_MS || 120000), log });
+const M = new Marionette({ host: HOST, port: PORT, commandTimeoutMs: Number(process.env.FX_MCP_CMD_TIMEOUT_MS || 120000), initialPage: validInitialPage(process.env.FX_MCP_INITIAL_PAGE, 'blank'), log });
 let snapshotRefs = [];
 
 // ---------------- element helpers ----------------
@@ -682,7 +692,8 @@ const TOOLS = [
       ...launched,
     };
   }),
-  T('fx_launch', 'Bootstrap option 1 — start a NEW dedicated Firefox with Marionette: a fresh profile on a NEW port, with the port set through the profile user.js PREFERENCES (user_pref marionette.port / marionette.enabled — Firefox has no --marionette-port CLI flag, so this is the only way to move it off the default 2828), then `firefox --marionette --no-remote -profile <dir>`, and attach to it. The instance starts empty (no cookies/logins from your daily profile). Port defaults to the first free port above the configured one. Binary: FX_MCP_FIREFOX_BIN env (e.g. "node /path/standin.mjs") or firefox on PATH / common system paths. Returns the started pid, port, and profile, and leaves the MCP attached to the new instance. Run it only when the user chose this option from a decision payload or explicitly asked to start a new browser — never as a silent fallback when the configured endpoint is busy.', { port: { type: 'number', description: 'marionette port; default = first free port above the configured one' }, profile: { type: 'string', description: 'profile directory; default <profile root>/firefox-mcp-marionette-<port>' } }, async (a) => {
+  T('fx_launch', 'Bootstrap option 1 — start a NEW dedicated Firefox with Marionette: a fresh profile on a NEW port, with the port set through the profile user.js PREFERENCES (user_pref marionette.port / marionette.enabled — Firefox has no --marionette-port CLI flag, so this is the only way to move it off the default 2828), then `firefox --marionette --no-remote -profile <dir>`, and attach to it. The instance starts empty (no cookies/logins from your daily profile). Port defaults to the first free port above the configured one. Binary: FX_MCP_FIREFOX_BIN env (e.g. "node /path/standin.mjs") or firefox on PATH / common system paths. initialPage: "blank" (default) redirects the fresh internal tab to about:blank so content commands work immediately; "newtab" leaves it untouched. Returns the started pid, port, and profile, and leaves the MCP attached to the new instance. Run it only when the user chose this option from a decision payload or explicitly asked to start a new browser — never as a silent fallback when the configured endpoint is busy.', { port: { type: 'number', description: 'marionette port; default = first free port above the configured one' }, profile: { type: 'string', description: 'profile directory; default <profile root>/firefox-mcp-marionette-<port>' }, initialPage: { type: 'string', enum: ['blank', 'newtab'], description: "initial tab after session start: 'blank' (default) redirects the fresh internal tab to about:blank; 'newtab' leaves it untouched" } }, async (a) => {
+    M.initialPage = validInitialPage((a || {}).initialPage, M.initialPage);
     const l = await doLaunch(a || {});
     return {
       ok: true,
@@ -721,7 +732,8 @@ const TOOLS = [
     }
     throw new Error('no fx_launch-managed instance recorded for port ' + ports.join(',') + ' — only browsers started by this server can be stopped; a Firefox you start yourself stays yours');
   }),
-  T('fx_connect', 'Point the MCP at a Firefox endpoint (host/port) and attach — this is how a running browser detected at the first-trigger probe gets committed (and how to re-point at runtime). Marionette serves ONE client per browser, so use a dedicated instance per automation — the env-configured default (FX_MARIONETTE_HOST/PORT) is used when both args are omitted. Loopback only (by design). Committing an endpoint makes later in-session reconnects silent. Returns the active endpoint + session; a failed attach returns the probe result + options instead of a raw error. Call it only after the user chose/approved it (a decision-payload option or their explicit direction).', { host: { type: 'string', description: 'loopback host, default 127.0.0.1' }, port: { type: 'number', description: 'marionette port, default = configured env port' } }, async (a) => {
+  T('fx_connect', 'Point the MCP at a Firefox endpoint (host/port) and attach — this is how a running browser detected at the first-trigger probe gets committed (and how to re-point at runtime). Marionette serves ONE client per browser, so use a dedicated instance per automation — the env-configured default (FX_MARIONETTE_HOST/PORT) is used when both args are omitted. Loopback only (by design). Committing an endpoint makes later in-session reconnects silent. initialPage: "blank" (default) redirects a non-web active tab to about:blank so content commands work immediately; "newtab" leaves it untouched (web pages are never redirected). Returns the active endpoint + session; a failed attach returns the probe result + options instead of a raw error. Call it only after the user chose/approved it (a decision-payload option or their explicit direction).', { host: { type: 'string', description: 'loopback host, default 127.0.0.1' }, port: { type: 'number', description: 'marionette port, default = configured env port' }, initialPage: { type: 'string', enum: ['blank', 'newtab'], description: "initial tab after session start: 'blank' (default) redirects a non-web active tab to about:blank; 'newtab' leaves it untouched" } }, async (a) => {
+    M.initialPage = validInitialPage((a || {}).initialPage, M.initialPage);
     if (a.host !== undefined) {
       const h = String(a.host);
       if (!/^(127\.\d{1,3}\.\d{1,3}\.\d{1,3}|localhost|::1)$/.test(h)) throw new Error('host must be loopback (127.x / localhost / ::1)');

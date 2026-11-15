@@ -5,7 +5,7 @@ import { encodeFrame, createFrameParser, frameKind } from './protocol.mjs';
 const noop = () => {};
 
 export class Marionette {
-  constructor({ host = '127.0.0.1', port = 2828, helloWaitMs = 1200, connectTimeoutMs = 60000, commandTimeoutMs = 120000, log = noop } = {}) {
+  constructor({ host = '127.0.0.1', port = 2828, helloWaitMs = 1200, connectTimeoutMs = 60000, commandTimeoutMs = 120000, initialPage = 'blank', log = noop } = {}) {
     this.host = host;
     this.port = port;
     this.helloWaitMs = helloWaitMs;
@@ -14,6 +14,11 @@ export class Marionette {
     // mid-navigation, hung page). Without this a single never-settling command
     // wedges the whole MCP server (commands are serialized upstream).
     this.commandTimeoutMs = commandTimeoutMs;
+    // 'blank' (default): after session start, redirect a non-web initial tab
+    // (chrome://…/blanktab.html on fresh profiles, any chrome:// / about: page)
+    // to about:blank so content-scope commands work immediately. 'newtab': leave
+    // the initial tab untouched. Web/file pages are never redirected.
+    this.initialPage = initialPage;
     this.log = log;
     this.sock = null;
     this.parser = null;
@@ -104,7 +109,8 @@ export class Marionette {
     }
   }
 
-  send(name, params) {
+  // Raw protocol send (no recovery).
+  _sendRaw(name, params) {
     if (!this.sock || this.sock.destroyed) return Promise.reject(new Error('not connected'));
     const id = this.nextId++;
     this.sock.write(encodeFrame([0, id, name, params ?? {}]));
@@ -120,11 +126,51 @@ export class Marionette {
     });
   }
 
+  // Send with privileged-scope recovery. Recent Firefox (observed on 160)
+  // refuses content-scope commands — ExecuteScript, FindElement, ElementClick,
+  // ElementSendKeys, TakeScreenshot, alert commands, cookies and 27 more (35 of
+  // 55 driver commands) — while the current tab is a non-web page (the
+  // fresh-profile tab chrome://…/blanktab.html, any chrome:// or about: page)
+  // with: "The command does not support browsing contexts in privileged scope".
+  // Recovery: navigate the blank/internal tab to about:blank (privileged-safe)
+  // and retry the command ONCE. NewSession is excluded (no session yet — nothing
+  // to navigate); Navigate/GetCurrentURL cannot raise the error (they skip the
+  // privilege check). A retried element command may fail with a fresh, accurate
+  // error (stale element) — expected, and more useful than the scope error.
+  async send(name, params) {
+    try {
+      return await this._sendRaw(name, params);
+    } catch (e) {
+      if (name === 'WebDriver:NewSession') throw e;
+      if (!/does not support browsing contexts in privileged scope/i.test(String((e && e.message) || e))) throw e;
+      this.log('privileged-scope failure on ' + name + ' — navigating to about:blank and retrying once');
+      await this._sendRaw('WebDriver:Navigate', { url: 'about:blank' }).catch((ne) => this.log('recovery navigation failed:', ne.message));
+      return this._sendRaw(name, params);
+    }
+  }
+
   // Wait for the on-connect hello, then open a session.
+  // When initialPage === 'blank' (default), a non-web initial tab (the
+  // fresh-profile chrome://…/blanktab.html, about:newtab, any chrome:// page) is
+  // redirected to about:blank so content-scope commands work immediately.
+  // 'newtab' leaves the initial tab untouched (the send() recovery above still
+  // protects individual commands). Web/file pages are never redirected.
   async init() {
     await new Promise((r) => setTimeout(r, this.helloWaitMs));
     const r = await this.send('WebDriver:NewSession', { strictFileInteractability: true });
     this.sessionId = r.sessionId;
+    if (this.initialPage === 'blank') {
+      try {
+        const cur = await this._sendRaw('WebDriver:GetCurrentURL', {});
+        const url = String((cur && cur.value) || '');
+        if (url && !/^(https?|file):/i.test(url)) {
+          await this._sendRaw('WebDriver:Navigate', { url: 'about:blank' });
+          this.log('initial tab "' + url + '" → about:blank');
+        }
+      } catch (e) {
+        this.log('initial-page normalize skipped:', e.message);
+      }
+    }
     this.log('session', this.sessionId, 'protocol', this.hello && this.hello.marionetteProtocol);
     return this.sessionId;
   }

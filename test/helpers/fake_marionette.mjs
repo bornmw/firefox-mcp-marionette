@@ -74,11 +74,29 @@ export function startFakeMarionette(port = 0) {
 }
 
 function respond(id, name, params, state) {
+  // Simulate recent-Firefox behavior: content-scope commands fail with the
+  // privileged-scope error while the current tab is a non-web page.
+  //   state.privilegedOnce:  Set of command names to fail once (then succeed)
+  //   state.privilegedAlways: true → every listed/any command keeps failing
+  const scopeErr = [1, id, { error: 'unsupported operation', message: 'The command does not support browsing contexts in privileged scope' }, null];
+  // NewSession cannot raise the scope error in real Firefox; this dedicated
+  // flag exists only to test the client's no-recovery guard for it.
+  if (name === 'WebDriver:NewSession' && state.newSessionScopeErrorOnce) {
+    state.newSessionScopeErrorOnce = false;
+    return scopeErr;
+  }
+  if (name !== 'WebDriver:NewSession' && name !== 'WebDriver:Navigate' && name !== 'WebDriver:GetCurrentURL') {
+    const once = state.privilegedOnce;
+    if (state.privilegedAlways || (once && once.has(name))) {
+      if (once) once.delete(name);
+      return scopeErr;
+    }
+  }
   switch (name) {
     case 'WebDriver:NewSession':
       return [1, id, null, { sessionId: 'fake-sess-1', capabilities: { browserName: 'firefox' } }];
     case 'WebDriver:GetTitle': return [1, id, null, { value: 'Fake Page' }];
-    case 'WebDriver:GetCurrentURL': return [1, id, null, { value: 'https://fake.test/' }];
+    case 'WebDriver:GetCurrentURL': return [1, id, null, { value: state.currentUrl || 'https://fake.test/' }];
     case 'WebDriver:Navigate': return [1, id, null, {}];
     case 'WebDriver:FindElement': return [1, id, null, { value: { [W3C_ELEMENT_KEY]: 'el-uuid-1' } }];
     case 'WebDriver:ElementClick':
