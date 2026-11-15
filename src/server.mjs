@@ -1427,6 +1427,18 @@ async function ensureConn() {
   if (connected && M.sock && !M.sock.destroyed) return;
   await M.connect();
   if (!M.sessionId) await M.init();
+  // Normalize a degenerate window: fresh profiles can open tiny on some
+  // compositors (observed 552x172 on Wayfire), where a page's fixed header
+  // covers the whole viewport. Height < 300 px gets set to 1280x900 so page
+  // content is usable without caller-side work. Best effort — a failing
+  // window query must not block the attach.
+  try {
+    const rect = await M.cmd('WebDriver:GetWindowRect', {});
+    if (rect && Number(rect.height) < 300) {
+      await M.cmd('WebDriver:SetWindowRect', { width: 1280, height: 900 });
+      log('window degenerate ' + rect.width + 'x' + rect.height + ' — auto-resized to 1280x900');
+    }
+  } catch { /* best effort */ }
   connected = true;
 }
 

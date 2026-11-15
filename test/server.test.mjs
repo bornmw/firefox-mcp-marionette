@@ -464,6 +464,25 @@ test('fx_key sends real W3C PUA codepoints, not literal \\ueXXXX text', async ()
   }
 });
 
+test('ensureConn auto-resizes a degenerate window on attach', async () => {
+  fake.state.windowRect = { x: 0, y: 0, width: 552, height: 172 };
+  try {
+    // a fresh attach to a degenerate window normalizes it to 1280x900
+    const r = await rpc({ jsonrpc: '2.0', id: 97, method: 'tools/call', params: { name: 'fx_connect', arguments: { port: fake.port } } });
+    assert.equal(JSON.parse(toolText(r)).ok, true);
+    assert.deepEqual(fake.state.lastSetWindowRect, { width: 1280, height: 900 }, 'degenerate window normalized on attach');
+    // a normal window is left untouched
+    delete fake.state.lastSetWindowRect;
+    fake.state.windowRect = { x: 0, y: 0, width: 1280, height: 900 };
+    const r2 = await rpc({ jsonrpc: '2.0', id: 98, method: 'tools/call', params: { name: 'fx_connect', arguments: { port: fake.port } } });
+    assert.equal(JSON.parse(toolText(r2)).ok, true);
+    assert.equal(fake.state.lastSetWindowRect, undefined, 'normal window untouched');
+  } finally {
+    delete fake.state.windowRect;
+    delete fake.state.lastSetWindowRect;
+  }
+});
+
 test('stdin EOF terminates the server cleanly', () =>
   new Promise((resolve, reject) => {
     const t0 = Date.now();
