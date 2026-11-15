@@ -132,11 +132,15 @@ const evalJs = (js) => call('fx_eval', { js }).then((r) => {
 try {
   const list = await rpc('tools/list', {});
   const schema = (name) => list.result.tools.find((t) => t.name === name).inputSchema.properties;
-  await check('tools/list: 27 tools; fx_snapshot/fx_form gained deep param', { result: { content: [{ text: '' }] } }, (t, e) => {
+  await check('tools/list: 31 tools; fx_snapshot/fx_form gained deep param', { result: { content: [{ text: '' }] } }, (t, e) => {
     if (e) return false;
     const names = list.result.tools.map((t) => t.name);
-    return names.length === 27 && schema('fx_snapshot').deep && schema('fx_form').deep && schema('fx_click').ref;
+    return names.length === 31 && schema('fx_snapshot').deep && schema('fx_form').deep && schema('fx_click').ref;
   });
+
+  // Commit the endpoint (0.9.0 asks before attaching) and set a sane window
+  // size — fresh profiles can open degenerate-small (see e2e-forms.mjs).
+  await call('fx_connect', { host: '127.0.0.1', port, width: 1280, height: 900 });
 
   await call('fx_navigate', { url: 'file://' + TEST_HTML });
   await new Promise((r) => setTimeout(r, 900));

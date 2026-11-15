@@ -732,7 +732,7 @@ const TOOLS = [
     }
     throw new Error('no fx_launch-managed instance recorded for port ' + ports.join(',') + ' — only browsers started by this server can be stopped; a Firefox you start yourself stays yours');
   }),
-  T('fx_connect', 'Point the MCP at a Firefox endpoint (host/port) and attach — this is how a running browser detected at the first-trigger probe gets committed (and how to re-point at runtime). Marionette serves ONE client per browser, so use a dedicated instance per automation — the env-configured default (FX_MARIONETTE_HOST/PORT) is used when both args are omitted. Loopback only (by design). Committing an endpoint makes later in-session reconnects silent. initialPage: "blank" (default) redirects a non-web active tab to about:blank so content commands work immediately; "newtab" leaves it untouched (web pages are never redirected). Returns the active endpoint + session; a failed attach returns the probe result + options instead of a raw error. Call it only after the user chose/approved it (a decision-payload option or their explicit direction).', { host: { type: 'string', description: 'loopback host, default 127.0.0.1' }, port: { type: 'number', description: 'marionette port, default = configured env port' }, initialPage: { type: 'string', enum: ['blank', 'newtab'], description: "initial tab after session start: 'blank' (default) redirects a non-web active tab to about:blank; 'newtab' leaves it untouched" } }, async (a) => {
+  T('fx_connect', 'Point the MCP at a Firefox endpoint (host/port) and attach — this is how a running browser detected at the first-trigger probe gets committed (and how to re-point at runtime). Marionette serves ONE client per browser, so use a dedicated instance per automation — the env-configured default (FX_MARIONETTE_HOST/PORT) is used when both args are omitted. Loopback only (by design). Committing an endpoint makes later in-session reconnects silent. initialPage: "blank" (default) redirects a non-web active tab to about:blank so content commands work immediately; "newtab" leaves it untouched (web pages are never redirected). Returns the active endpoint + session; a failed attach returns the probe result + options instead of a raw error. Optional width/height (integers >= 200; give at least one, the missing one defaults to 1280/900): resize the window right after attaching — useful when the browser opened at a degenerate size (fresh profiles can open at e.g. 552x172 on some compositors, where a fixed page header covers the whole viewport). Call it only after the user chose/approved it (a decision-payload option or their explicit direction).', { host: { type: 'string', description: 'loopback host, default 127.0.0.1' }, port: { type: 'number', description: 'marionette port, default = configured env port' }, initialPage: { type: 'string', enum: ['blank', 'newtab'], description: "initial tab after session start: 'blank' (default) redirects a non-web active tab to about:blank; 'newtab' leaves it untouched" }, width: { type: 'number', description: 'optional: window width in px to set after attaching (>= 200)' }, height: { type: 'number', description: 'optional: window height in px to set after attaching (>= 200)' } }, async (a) => {
     M.initialPage = validInitialPage((a || {}).initialPage, M.initialPage);
     if (a.host !== undefined) {
       const h = String(a.host);
@@ -763,8 +763,16 @@ const TOOLS = [
         ...bootstrapOptions(probe),
       };
     }
+    let window = null;
+    if (a.width !== undefined || a.height !== undefined) {
+      const w = Number(a.width !== undefined ? a.width : 1280);
+      const h = Number(a.height !== undefined ? a.height : 900);
+      if (!Number.isInteger(w) || w < 200 || !Number.isInteger(h) || h < 200) throw new Error('width/height must be integers >= 200');
+      await M.cmd('WebDriver:SetWindowRect', { width: w, height: h });
+      window = { width: w, height: h };
+    }
     attachApproved = { host: M.host, port: M.port };
-    return { ok: true, endpoint: { host: M.host, port: M.port }, configured: { host: HOST, port: PORT }, session: M.sessionId, protocol: M.hello && M.hello.marionetteProtocol };
+    return { ok: true, endpoint: { host: M.host, port: M.port }, configured: { host: HOST, port: PORT }, session: M.sessionId, protocol: M.hello && M.hello.marionetteProtocol, ...(window ? { window } : {}) };
   }),
   T('fx_navigate', 'Navigate the active tab to a URL', { url: { type: 'string' } }, async (a) => {
     await M.cmd('WebDriver:Navigate', { url: a.url });
@@ -1287,27 +1295,29 @@ const TOOLS = [
     const times = Math.min(200, Math.max(1, Number(a.times) || 1));
     // W3C WebDriver key values use Unicode PUA codepoints (U+E000–U+E040).
     // Marionette ElementSendKeys expects these, not named strings.
+    // W3C PUA key codepoints as real characters (NOT the 6-char literal
+    // "\\ue007" text — ElementSendKeys needs the actual U+E0xx codepoint).
     const W3C_KEY = {
-      'NULL': '\\ue000', 'CANCEL': '\\ue001', 'HELP': '\\ue002',
-      'BACK_SPACE': '\\ue003', 'BACKSPACE': '\\ue003',
-      'TAB': '\\ue004', 'CLEAR': '\\ue005',
-      'RETURN': '\\ue006', 'ENTER': '\\ue007',
-      'SHIFT': '\\ue008', 'CONTROL': '\\ue009', 'CTRL': '\\ue009', 'ALT': '\\ue00a',
-      'PAUSE': '\\ue00b', 'ESCAPE': '\\ue00c', 'ESC': '\\ue00c',
-      'SPACE': '\\ue00d',
-      'PAGE_UP': '\\ue00e', 'PAGEUP': '\\ue00e',
-      'PAGE_DOWN': '\\ue00f', 'PAGEDOWN': '\\ue00f',
-      'END': '\\ue010', 'HOME': '\\ue011',
-      'ARROW_LEFT': '\\ue012', 'LEFT': '\\ue012',
-      'ARROW_UP': '\\ue013', 'UP': '\\ue013',
-      'ARROW_RIGHT': '\\ue014', 'RIGHT': '\\ue014',
-      'ARROW_DOWN': '\\ue015', 'DOWN': '\\ue015',
-      'INSERT': '\\ue016', 'DELETE': '\\ue017', 'DEL': '\\ue017',
+      'NULL': '\ue000', 'CANCEL': '\ue001', 'HELP': '\ue002',
+      'BACK_SPACE': '\ue003', 'BACKSPACE': '\ue003',
+      'TAB': '\ue004', 'CLEAR': '\ue005',
+      'RETURN': '\ue006', 'ENTER': '\ue007',
+      'SHIFT': '\ue008', 'CONTROL': '\ue009', 'CTRL': '\ue009', 'ALT': '\ue00a',
+      'PAUSE': '\ue00b', 'ESCAPE': '\ue00c', 'ESC': '\ue00c',
+      'SPACE': '\ue00d',
+      'PAGE_UP': '\ue00e', 'PAGEUP': '\ue00e',
+      'PAGE_DOWN': '\ue00f', 'PAGEDOWN': '\ue00f',
+      'END': '\ue010', 'HOME': '\ue011',
+      'ARROW_LEFT': '\ue012', 'LEFT': '\ue012',
+      'ARROW_UP': '\ue013', 'UP': '\ue013',
+      'ARROW_RIGHT': '\ue014', 'RIGHT': '\ue014',
+      'ARROW_DOWN': '\ue015', 'DOWN': '\ue015',
+      'INSERT': '\ue016', 'DELETE': '\ue017', 'DEL': '\ue017',
       // F1–F12: U+E031–U+E03C; F13–F24 continue the sequence
-      'F1': '\\ue031', 'F2': '\\ue032', 'F3': '\\ue033', 'F4': '\\ue034', 'F5': '\\ue035',
-      'F6': '\\ue036', 'F7': '\\ue037', 'F8': '\\ue038', 'F9': '\\ue039',
-      'F10': '\\ue03a', 'F11': '\\ue03b', 'F12': '\\ue03c',
-      'META': '\\ue03d', 'COMMAND': '\\ue03d', 'OS': '\\ue03d',
+      'F1': '\ue031', 'F2': '\ue032', 'F3': '\ue033', 'F4': '\ue034', 'F5': '\ue035',
+      'F6': '\ue036', 'F7': '\ue037', 'F8': '\ue038', 'F9': '\ue039',
+      'F10': '\ue03a', 'F11': '\ue03b', 'F12': '\ue03c',
+      'META': '\ue03d', 'COMMAND': '\ue03d', 'OS': '\ue03d',
     };
     const parts = String(a.key).split('+');
     const modifiers = [];

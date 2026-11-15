@@ -144,7 +144,10 @@ try {
 
   // Commit the endpoint so the first browser call doesn't hit the
   // browser-detected gate (a fresh server process has no committed endpoint).
-  await call('fx_connect', { host: '127.0.0.1', port });
+  // Also set a sane window size: fresh profiles can open at a degenerate size
+  // (observed 552x172 on Wayfire), where the page's fixed #nav covers the whole
+  // viewport and every click lands under it.
+  await call('fx_connect', { host: '127.0.0.1', port, width: 1280, height: 900 });
 
   await call('fx_navigate', { url: 'file://' + TEST_HTML });
   await sleep(800);

@@ -120,7 +120,11 @@ function check(label, r, expect) {
 try {
   const list = await rpc('tools/list', {});
   const names = list.result.tools.map((t) => t.name);
-  check('tools/list: 27 tools incl. fx_gates + fx_connect + read tools', { result: { content: [{ text: names.join(',') }] } }, (t) => ['fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_connect', 'fx_links', 'fx_extract', 'fx_search'].every((n) => t.includes(n)) && t.split(',').length === 27);
+  check('tools/list: 31 tools incl. fx_gates + fx_connect + read tools', { result: { content: [{ text: names.join(',') }] } }, (t) => ['fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_connect', 'fx_links', 'fx_extract', 'fx_search'].every((n) => t.includes(n)) && t.split(',').length === 31);
+
+  // Commit the endpoint (0.9.0 asks before attaching) and set a sane window
+  // size — fresh profiles can open degenerate-small (see e2e-forms.mjs).
+  await call('fx_connect', { host: '127.0.0.1', port, width: 1280, height: 900 });
 
   await call('fx_navigate', { url: 'file://' + TEST_HTML });
   await new Promise((r) => setTimeout(r, 700));

@@ -424,6 +424,46 @@ test('fx_connect re-points the MCP at a different endpoint at runtime', async ()
   }
 });
 
+test('fx_connect {width, height} resizes the window after attaching', async () => {
+  fake.state.windowRect = { x: 0, y: 0, width: 552, height: 172 };
+  try {
+    const r = await rpc({ jsonrpc: '2.0', id: 90, method: 'tools/call', params: { name: 'fx_connect', arguments: { width: 1280, height: 900 } } });
+    const o = JSON.parse(toolText(r));
+    assert.equal(o.ok, true);
+    assert.deepEqual(o.window, { width: 1280, height: 900 }, 'result reports the applied size');
+    assert.deepEqual(fake.state.lastSetWindowRect, { width: 1280, height: 900 }, 'SetWindowRect issued');
+    // one of the pair may be omitted (defaults to the standard value)
+    const r1 = await rpc({ jsonrpc: '2.0', id: 91, method: 'tools/call', params: { name: 'fx_connect', arguments: { width: 1000 } } });
+    assert.deepEqual(JSON.parse(toolText(r1)).window, { width: 1000, height: 900 });
+    // degenerate/too-small sizes are rejected
+    const r2 = await rpc({ jsonrpc: '2.0', id: 92, method: 'tools/call', params: { name: 'fx_connect', arguments: { width: 50 } } });
+    toolErr(r2, /integers >= 200/);
+  } finally {
+    delete fake.state.windowRect;
+    delete fake.state.lastSetWindowRect;
+  }
+});
+
+test('fx_key sends real W3C PUA codepoints, not literal \\ueXXXX text', async () => {
+  try {
+    // named key: End must be the single codepoint U+E010 (scrolling depends on it)
+    await rpc({ jsonrpc: '2.0', id: 93, method: 'tools/call', params: { name: 'fx_key', arguments: { key: 'End' } } });
+    assert.equal(fake.state.lastSendKeysText, String.fromCharCode(0xe010), 'End = U+E010 codepoint');
+    assert.notEqual(fake.state.lastSendKeysText, '\\ue010', 'must not be the 6-char literal escape text');
+    // modifier chord: Control+a = U+E009 + 'a'
+    await rpc({ jsonrpc: '2.0', id: 94, method: 'tools/call', params: { name: 'fx_key', arguments: { key: 'Control+a' } } });
+    assert.equal(fake.state.lastSendKeysText, String.fromCharCode(0xe009) + 'a', 'Control+a chord');
+    // plain letter passes through as-is
+    await rpc({ jsonrpc: '2.0', id: 95, method: 'tools/call', params: { name: 'fx_key', arguments: { key: 'a' } } });
+    assert.equal(fake.state.lastSendKeysText, 'a', 'plain letter');
+    // F-key range keeps its own (correct) fromCharCode path
+    await rpc({ jsonrpc: '2.0', id: 96, method: 'tools/call', params: { name: 'fx_key', arguments: { key: 'F5' } } });
+    assert.equal(fake.state.lastSendKeysText, String.fromCharCode(0xe035), 'F5 = U+E035');
+  } finally {
+    delete fake.state.lastSendKeysText;
+  }
+});
+
 test('stdin EOF terminates the server cleanly', () =>
   new Promise((resolve, reject) => {
     const t0 = Date.now();

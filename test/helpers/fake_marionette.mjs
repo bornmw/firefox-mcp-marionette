@@ -104,11 +104,17 @@ function respond(id, name, params, state) {
       if (state.clickFailOnce) { state.clickFailOnce = null; return [1, id, { error: 'element click intercepted', message: 'Message: Element <button class="x"> is not clickable at point (1188,362) because another element <div class="y"> obscures it' }, null]; }
       return [1, id, null, {}];
     case 'WebDriver:ElementClear':
-    case 'WebDriver:ElementSendKeys':
     case 'WebDriver:SwitchToWindow': return [1, id, null, {}];
+    case 'WebDriver:ElementSendKeys':
+      state.lastSendKeysText = String((params && params.text) || '');
+      return [1, id, null, {}];
     case 'WebDriver:TakeScreenshot': return [1, id, null, { value: Buffer.from('FAKEPNG').toString('base64') }];
     case 'WebDriver:GetWindowHandles': return [1, id, null, { value: ['w1'] }];
     case 'WebDriver:GetWindowHandle': return [1, id, null, { value: 'w1' }];
+    case 'WebDriver:GetWindowRect': return [1, id, null, state.windowRect || { x: 0, y: 0, width: 1280, height: 900 }];
+    case 'WebDriver:SetWindowRect':
+      state.lastSetWindowRect = { width: Number(params && params.width), height: Number(params && params.height) };
+      return [1, id, null, null];
     case 'WebDriver:GetCookies': return [1, id, null, { value: [] }];
     case 'WebDriver:GetAlertText': return [1, id, null, { value: 'dialog?' }];
     case 'WebDriver:AcceptAlert':
