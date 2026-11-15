@@ -91,6 +91,8 @@ test('tools/list exposes the full tool table', async () => {
   }
   const fe = r.result.tools.find((t) => t.name === 'fx_eval');
   assert.equal(fe.inputSchema.properties.wait_ms.type, 'number', 'fx_eval.wait_ms (Promise await)');
+  assert.deepEqual(fe.inputSchema.required, ['js'], 'fx_eval.js is required in the schema');
+  assert.match(fe.description, /REQUIRED/);
   assert.match(fe.description, /awaited/);
   const fs = r.result.tools.find((t) => t.name === 'fx_screenshot');
   assert.match(fs.description, /full-page/i);
@@ -227,6 +229,13 @@ test('fx_eval errors with a clear message when the Promise never settles', async
   fake.state.pollCount = 0;
   const r = await rpc({ jsonrpc: '2.0', id: 24, method: 'tools/call', params: { name: 'fx_eval', arguments: { js: 'return new Promise(() => {});', wait_ms: 400 } } });
   toolErr(r, /did not settle within 400 ms/);
+});
+
+test('fx_eval rejects a call without js (not a silent null)', async () => {
+  const r = await rpc({ jsonrpc: '2.0', id: 25, method: 'tools/call', params: { name: 'fx_eval', arguments: {} } });
+  toolErr(r, /`js` is required/);
+  const r2 = await rpc({ jsonrpc: '2.0', id: 26, method: 'tools/call', params: { name: 'fx_eval', arguments: { expression: 'document.title' } } });
+  toolErr(r2, /`js` is required/);
 });
 
 test('fx_upload rejects paths outside allowed roots', async () => {

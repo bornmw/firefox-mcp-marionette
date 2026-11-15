@@ -660,7 +660,7 @@ function fmtField(f) {
 }
 
 // ---------------- MCP tools ----------------
-const T = (name, desc, schema, fn) => ({ name, description: desc, inputSchema: { type: 'object', properties: schema, additionalProperties: false }, fn });
+const T = (name, desc, schema, fn, required) => ({ name, description: desc, inputSchema: { type: 'object', properties: schema, additionalProperties: false, ...(required ? { required } : {}) }, fn });
 
 const TOOLS = [
   T('fx_status', 'Health: connection, session, active + configured endpoint, current page, navigator.webdriver flag. Never opens a session on its own: with no committed endpoint it probes non-invasively (TCP connect, expect the Marionette hello, close) and reports connected:false with the probe result and decision options; with a committed endpoint it attaches/re-attaches and reports live state. Reports launched/launchedCurrent when this server started the instance. When the result contains a `bootstrap` decision, present its question/options to the user and act only on THEIR choice.', {}, async () => {
@@ -1194,7 +1194,8 @@ const TOOLS = [
     }
     return { engine: a.engine || 'google', query: q, url: serp, ready, count: rows.length, results: rows };
   }),
-  T('fx_eval', 'Execute JS in the page. `js` is tried as an EXPRESSION first — its completion value is returned, so `1 + 1`, `document.title`, `var x = 1; x`, `(async () => { … })()` and `fetch(u).then(r => r.json())` all work without `return`. If that fails with a SyntaxError (classic function-body style with a top-level `return`), it is re-run as a function body — so `return value` scripts work too. A rejected or Promise value is awaited (default max 30s, wait_ms to tune) and returned as {r: value, awaited: true}; a rejected or long-unsettled Promise is an error. The result is ALWAYS a {r, …} object: r is the value, and a `note` field disambiguates completion-with-undefined (note:"undefined" — the expression ran but produced no value; your selector likely matched nothing) from a real null (r===null with no note). Never returns a bare null.', { js: { type: 'string' }, wait_ms: { type: 'number', description: 'max wait for a Promise-returning body (default 30000, max 120000)' } }, async (a) => {
+  T('fx_eval', 'Execute JS in the page. `js` is REQUIRED (a call without it is an error — it is not silently evaluated as "nothing"). `js` is tried as an EXPRESSION first — its completion value is returned, so `1 + 1`, `document.title`, `var x = 1; x`, `(async () => { … })()` and `fetch(u).then(r => r.json())` all work without `return`. If that fails with a SyntaxError (classic function-body style with a top-level `return`), it is re-run as a function body — so `return value` scripts work too. A rejected or Promise value is awaited (default max 30s, wait_ms to tune) and returned as {r: value, awaited: true}; a rejected or long-unsettled Promise is an error. The result is ALWAYS a {r, …} object: r is the value, and a `note` field disambiguates completion-with-undefined (note:"undefined" — the expression ran but produced no value; your selector likely matched nothing) from a real null (r===null with no note). Never returns a bare null.', { js: { type: 'string', description: 'the code to evaluate (required)' }, wait_ms: { type: 'number', description: 'max wait for a Promise-returning body (default 30000, max 120000)' } }, async (a) => {
+    if (typeof a.js !== 'string' || !a.js.trim()) throw new Error('fx_eval: `js` is required — pass the code to evaluate as the js parameter');
     const w = await execJs(EVAL_WRAP, [String(a.js)]);
     if (!w || typeof w !== 'object' || typeof w.__fx !== 'string') {
       throw new Error('fx_eval: unexpected driver response (no eval wrapper tag)');
@@ -1220,7 +1221,7 @@ const TOOLS = [
       if (Date.now() - t0 > ms) throw new Error('fx_eval: Promise did not settle within ' + ms + ' ms');
       await new Promise((r) => setTimeout(r, 150));
     }
-  }),
+  }, ['js']),
   T('fx_text', 'Return the text of an element — the simplest way to read long content (an AI response, an article, a table cell) without fx_eval JS. By ref (from fx_snapshot) or CSS selector. Returns innerText (visible, layout-aware) by default; use raw:true for textContent (includes hidden nodes, no line breaks). Crosses OPEN shadow roots: a shadow ref (marked SHADOW in fx_snapshot) is resolved in-page. If the selector matches several elements and all:true is set, returns one entry per match (capped at max). For the whole page, use selector "body".', {
     ref: { type: 'number' },
     selector: { type: 'string', description: 'CSS selector (default: body → whole page)' },
